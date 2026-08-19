@@ -1,0 +1,2681 @@
+export const ANDROID_WORKFLOW_PATH = ".github/workflows/apkforge-android.yml";
+export const ANDROID_WORKFLOW_FILENAME = "apkforge-android.yml";
+
+/**
+ * Structural check that `workflow_dispatch:` is genuinely a direct child of
+ * a top-level `on:` key — not merely present somewhere in the text (which a
+ * plain substring/regex search would wrongly accept even if it were nested
+ * under `jobs:`, `env:`, or anywhere else GitHub Actions would silently
+ * ignore it). Deliberately doesn't depend on a full YAML parser: this file
+ * ships as a plain string, and correctness here only needs indentation
+ * structure, not general YAML semantics.
+ */
+export function validateAndroidWorkflowYaml(yaml: string): { valid: boolean; error?: string } {
+  const lines = yaml.split("\n");
+  const onLineIdx = lines.findIndex((l) => /^on:\s*(#.*)?$/.test(l));
+  if (onLineIdx === -1) {
+    return {
+      valid: false,
+      error: 'No top-level "on:" key found (checked for it at column 0, with no inline value).',
+    };
+  }
+
+  // Determine the indentation of the on: block's contents from its first
+  // non-blank line, then walk forward only while still inside that block.
+  let blockIndent: number | null = null;
+  let foundAtCorrectDepth = false;
+  let foundElsewhere = false;
+  for (let i = onLineIdx + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === "" || /^\s*#/.test(line)) continue;
+    const indent = line.match(/^(\s*)/)?.[1].length ?? 0;
+    if (indent === 0) break; // back to a top-level key — on: block has ended
+
+    if (blockIndent === null) blockIndent = indent;
+    if (indent < blockIndent) break; // dedented out of the on: block
+
+    if (indent === blockIndent && /^\s*workflow_dispatch:\s*(#.*)?$/.test(line)) {
+      foundAtCorrectDepth = true;
+      break;
+    }
+  }
+  if (!foundAtCorrectDepth) {
+    foundElsewhere = /^\s*workflow_dispatch:\s*(#.*)?$/m.test(yaml);
+    return {
+      valid: false,
+      error: foundElsewhere
+        ? '"workflow_dispatch:" was found in the file, but not as a direct child of the top-level "on:" key — GitHub silently ignores it anywhere else (e.g. under jobs:, env:, or permissions:).'
+        : 'The top-level "on:" key does not declare a "workflow_dispatch:" trigger.',
+    };
+  }
+  return { valid: true };
+}
+
+// Universal Capacitor/Android pipeline: detects the project shape, installs deps,
+// generates/repairs the native project, validates + auto-repairs native config,
+// validates signing, builds, then verifies the produced APK.
+// run-name embeds the APKForge build_id so we can correlate the correct Actions run later.
+export const ANDROID_WORKFLOW_YAML = `name: APKForge Android
+run-name: "APKForge Android · \${{ inputs.build_id }}"
+on:
+  workflow_dispatch:
+    inputs:
+      build_id: { description: "APKForge build id", required: true }
+      source_url: { description: "Signed URL to source zip", required: true }
+      project_kind: { description: "capacitor-full | capacitor-partial | web-app", required: true }
+      app_name: { description: "App display name", required: false, default: "App" }
+      bundle_id: { description: "Reverse-DNS bundle id", required: true }
+      web_dir: { description: "Web build output directory", required: false, default: "www" }
+      logo_url: { description: "Optional signed URL to a square app icon (PNG)", required: false, default: "" }
+      node_version: { description: "Project web-build Node.js major version (20-24)", required: false, default: "22" }
+      finalize_endpoint: { description: "APKForge backend finalization endpoint", required: false, default: "" }
+      diagnostic_endpoint: { description: "APKForge sanitized runtime diagnostics endpoint", required: false, default: "" }
+      diagnostic_token: { description: "APKForge per-build diagnostics token", required: false, default: "" }
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      APP_NAME: \${{ github.event.inputs.app_name }}
+      BUNDLE_ID: \${{ github.event.inputs.bundle_id }}
+      WEB_DIR: \${{ github.event.inputs.web_dir }}
+      PROJECT_KIND: \${{ github.event.inputs.project_kind }}
+      BUILD_ID: \${{ github.event.inputs.build_id }}
+      FINALIZE_ENDPOINT: \${{ github.event.inputs.finalize_endpoint }}
+      DIAGNOSTIC_ENDPOINT: \${{ github.event.inputs.diagnostic_endpoint }}
+      DIAGNOSTIC_TOKEN: \${{ github.event.inputs.diagnostic_token }}
+      REPORT: \${{ github.workspace }}/project/android-prebuild-report.txt
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with: { node-version: "\${{ github.event.inputs.node_version }}" }
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: '21' }
+      - name: Fetch source
+        run: |
+          set -e
+          curl -sSL --fail -o source.zip "\${{ github.event.inputs.source_url }}"
+          mkdir -p project
+          unzip -q source.zip -d project
+          # Defense in depth: the website already refuses to package any zip
+          # entry containing path traversal, an absolute path, or a symlink
+          # (see validate-zip.ts) — but if a source zip ever reaches this
+          # runner some other way, never trust it blindly. Modern "unzip"
+          # already refuses ../ and absolute paths by default; explicitly
+          # strip any symlink that still made it through, since a symlink
+          # pointing outside project/ combined with a later write through it
+          # is the classic zip-slip bypass that plain path-traversal checks miss.
+          find project -type l -print -delete | sed 's/^/[security] removed unexpected symlink: /'
+          # If the zip wrapped everything in a single folder, flatten it.
+          cd project
+          if [ ! -f package.json ] && [ "$(ls -1 | wc -l)" = "1" ] && [ -d "$(ls -1)" ]; then
+            inner="$(ls -1)"
+            shopt -s dotglob
+            mv "$inner"/* . && rmdir "$inner"
+          fi
+          ls -la | head -n 40
+
+      - name: Environment diagnostics
+        working-directory: project
+        run: |
+          set -e
+          mkdir -p "$(dirname "$REPORT")"
+          : > "$REPORT"
+          log() { echo "$1" | tee -a "$REPORT"; }
+          log "========== APKForge Android pre-build report =========="
+          log "[env] Node: $(node --version)"
+          log "[env] npm: $(npm --version)"
+          log "[env] Java: $(java -version 2>&1 | head -n 1)"
+          log "[env] ANDROID_HOME: \${ANDROID_HOME:-not set}"
+          if command -v sdkmanager >/dev/null 2>&1; then
+            yes | sdkmanager --licenses >/dev/null 2>&1 || true
+            sdkmanager "platform-tools" "build-tools;34.0.0" "platforms;android-34" >/dev/null 2>&1 || true
+            log "[env] Android SDK: licences accepted, platform-tools/build-tools ensured"
+          else
+            log "[env] Android SDK: sdkmanager not found (using preinstalled image SDK)"
+          fi
+
+      - name: Detect project and install dependencies
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { echo "PREBUILD_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
+
+          if [ ! -f package.json ]; then
+            log "[detect] No package.json found — creating a minimal one (web-app mode)"
+            echo '{"name":"apkforge-app","version":"1.0.0","private":true}' > package.json
+          fi
+
+          # ---- Deterministic package-manager selection -------------------
+          # packageManager wins; otherwise the lockfile decides. When several
+          # lockfiles exist without packageManager we pick one deterministically
+          # (bun > pnpm > yarn > npm) and say so loudly — we never mix managers.
+          PM_FIELD="$(node -e "try{console.log(require('./package.json').packageManager||'')}catch(e){console.log('')}" 2>/dev/null || echo "")"
+          LOCKS=""
+          if [ -f bun.lockb ] || [ -f bun.lock ]; then LOCKS="$LOCKS bun"; fi
+          if [ -f pnpm-lock.yaml ]; then LOCKS="$LOCKS pnpm"; fi
+          if [ -f yarn.lock ]; then LOCKS="$LOCKS yarn"; fi
+          if [ -f package-lock.json ]; then LOCKS="$LOCKS npm"; fi
+          LOCK_COUNT="$(echo $LOCKS | wc -w)"
+          PM=""
+          case "$PM_FIELD" in
+            bun*) PM="bun" ;;
+            pnpm*) PM="pnpm" ;;
+            yarn*) PM="yarn" ;;
+            npm*) PM="npm" ;;
+          esac
+          if [ -n "$PM" ]; then
+            log "[detect] Package manager from package.json packageManager: $PM_FIELD"
+          else
+            PM="$(echo $LOCKS | awk '{print $1}')"
+            [ -n "$PM" ] || PM="npm"
+            if [ "$LOCK_COUNT" -gt 1 ]; then
+              log "[detect] WARNING: multiple lockfiles present ($LOCKS) and no packageManager field."
+              log "[detect] Deterministically selecting \\"$PM\\". Add a packageManager field to package.json to make this explicit."
+            fi
+          fi
+          case "$PM" in
+            bun)
+              command -v bun >/dev/null 2>&1 || curl -fsSL https://bun.sh/install | bash
+              export BUN_INSTALL="\${BUN_INSTALL:-$HOME/.bun}"; export PATH="$BUN_INSTALL/bin:$PATH"
+              echo "$BUN_INSTALL/bin" >> "$GITHUB_PATH"
+              command -v bun >/dev/null 2>&1 || fail "Project uses Bun but the Bun runtime could not be installed on the runner."
+              INSTALL_CMD="bun install"; ADD_CMD="bun add"; RUN_CMD="bun run"; EXEC_CMD="bunx" ;;
+            pnpm)
+              corepack enable; corepack prepare pnpm@latest --activate
+              INSTALL_CMD="pnpm install --no-frozen-lockfile"; ADD_CMD="pnpm add"; RUN_CMD="pnpm run"; EXEC_CMD="pnpm exec" ;;
+            yarn)
+              corepack enable; corepack prepare yarn@stable --activate
+              INSTALL_CMD="yarn install"; ADD_CMD="yarn add"; RUN_CMD="yarn"; EXEC_CMD="yarn" ;;
+            *)
+              PM="npm"
+              INSTALL_CMD="npm install --no-audit --no-fund"; ADD_CMD="npm install --no-audit --no-fund"; RUN_CMD="npm run"; EXEC_CMD="npx" ;;
+          esac
+          log "[detect] Package manager: $PM (lockfiles:\${LOCKS:- none})"
+
+          FRAMEWORK="$(node -e "
+            const p=require('./package.json');
+            const d={...(p.dependencies||{}),...(p.devDependencies||{})};
+            const has=(k)=>Object.prototype.hasOwnProperty.call(d,k);
+            let f='static-web';
+            if (has('next')) f='next';
+            else if (has('nuxt')||has('nuxt3')) f='nuxt';
+            else if (has('@angular/core')) f='angular';
+            else if (has('@sveltejs/kit')) f='sveltekit';
+            else if (has('svelte')) f='svelte';
+            else if (has('@tanstack/react-start')||has('@tanstack/start')) f='tanstack-start';
+            else if (has('@remix-run/react')) f='remix';
+            else if (has('@ionic/react')||has('@ionic/vue')||has('@ionic/angular')) f='ionic';
+            else if (has('vue')) f='vue';
+            else if (has('vite')) f='vite';
+            else if (has('react')) f='react';
+            console.log(f);
+          " 2>/dev/null || echo static-web)"
+          log "[detect] Framework: $FRAMEWORK"
+          if [ -f config.xml ] && grep -qi "<widget" config.xml 2>/dev/null; then
+            log "[detect] Cordova project detected — it will be migrated to a Capacitor native project"
+          fi
+          if [ -f capacitor.config.ts ] || [ -f capacitor.config.js ] || [ -f capacitor.config.json ]; then
+            log "[detect] Capacitor config present"
+          else
+            log "[detect] No Capacitor config — one will be generated"
+          fi
+          if [ -d android ]; then log "[detect] Existing android/ project present"; else log "[detect] No android/ project — it will be generated"; fi
+
+          {
+            echo "PM=$PM"
+            echo "INSTALL_CMD=$INSTALL_CMD"
+            echo "ADD_CMD=$ADD_CMD"
+            echo "RUN_CMD=$RUN_CMD"
+            echo "EXEC_CMD=$EXEC_CMD"
+            echo "DETECTED_FRAMEWORK=$FRAMEWORK"
+          } >> "$GITHUB_ENV"
+
+
+          if $INSTALL_CMD; then
+            log "[install] Dependencies installed with $PM"
+          elif [ "$PM" = "npm" ]; then
+            log "REPAIR: npm install failed — retrying once with --legacy-peer-deps"
+            npm install --no-audit --no-fund --legacy-peer-deps || fail "Dependency install failed for this project. Check the log above for the failing package."
+            log "REPAIR: recovered with npm --legacy-peer-deps (peer ranges were relaxed)"
+          else
+            fail "Dependency install failed with $PM. The project's lockfile selects $PM, so we do not fall back to another package manager — fix the failing package or commit a consistent lockfile."
+          fi
+
+          # Align Capacitor packages so core/cli/android share a major version.
+          node -e "
+            const fs=require('fs');
+            const p=JSON.parse(fs.readFileSync('package.json','utf8'));
+            const d={...(p.dependencies||{}),...(p.devDependencies||{})};
+            const maj=(v)=>{const m=String(v||'').match(/(\\d+)/);return m?m[1]:null;};
+            const majors=['@capacitor/core','@capacitor/cli','@capacitor/android'].map(k=>d[k]?maj(d[k]):null).filter(Boolean);
+            const uniq=[...new Set(majors)];
+            console.log('CAP_MAJORS='+(uniq.join(',')||'none'));
+          " | tee -a "$REPORT"
+
+          if node -e "require.resolve('@capacitor/cli')" 2>/dev/null; then
+            log "[capacitor] CLI present"
+          else
+            log "REPAIR: Capacitor CLI missing — installing @capacitor/core @capacitor/cli with $PM"
+            $ADD_CMD @capacitor/core @capacitor/cli || fail "Could not install the Capacitor CLI with $PM."
+          fi
+
+          # One Node version for the entire build. APKForge already raises the
+          # dispatched node_version to Capacitor's minimum, so a mismatch here is
+          # a hard failure rather than a silent mid-build toolchain switch.
+          REQ_NODE="$(node -e "try{const p=require('@capacitor/cli/package.json');const m=String((p.engines&&p.engines.node)||'').match(/(\\d+)/);console.log(m?m[1]:'')}catch(e){console.log('')}" 2>/dev/null || echo "")"
+          CUR_NODE="$(node -p "process.versions.node.split('.')[0]")"
+          if [ -n "$REQ_NODE" ] && [ "$CUR_NODE" -lt "$REQ_NODE" ]; then
+            fail "The installed Capacitor CLI requires Node >= $REQ_NODE but this build runs on Node $CUR_NODE. Raise the project's Node version (.nvmrc / engines.node) to $REQ_NODE or newer and rebuild — we do not switch Node midway through a build."
+          fi
+          log "[node] Single build Node version: $CUR_NODE (Capacitor CLI requires >= \${REQ_NODE:-unknown})"
+
+          CORE_MAJOR="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null || echo "")"
+          if [ -n "$CORE_MAJOR" ]; then
+            $ADD_CMD "@capacitor/android@^$CORE_MAJOR" || fail "Could not install @capacitor/android@^$CORE_MAJOR with $PM."
+          else
+            $ADD_CMD @capacitor/android || fail "Could not install @capacitor/android with $PM."
+          fi
+          log "[capacitor] Version: $($EXEC_CMD cap --version 2>/dev/null || echo unknown)"
+
+      - name: Verify dependencies and toolchain
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { echo "PREBUILD_VALIDATION_FAILED: DEPENDENCY_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
+          log "== Dependency verification =="
+
+          # --- Lockfile / package manager evidence -------------------------
+          LOCK="none"
+          if [ -f package-lock.json ]; then LOCK="package-lock.json"; fi
+          if [ -f yarn.lock ]; then LOCK="yarn.lock"; fi
+          if [ -f pnpm-lock.yaml ]; then LOCK="pnpm-lock.yaml"; fi
+          if [ -f bun.lockb ] || [ -f bun.lock ]; then LOCK="bun.lock"; fi
+          PM_FIELD="$(node -e "try{console.log(require('./package.json').packageManager||'')}catch(e){console.log('')}" 2>/dev/null)"
+          log "[deps] Package manager: \${PM:-npm} (lockfile: $LOCK\${PM_FIELD:+, packageManager: $PM_FIELD})"
+          if [ "$LOCK" = "none" ]; then log "[deps] No lockfile present — resolving from package.json ranges"; fi
+
+          missing_list() {
+            node -e "
+              const fs=require('fs');
+              const p=JSON.parse(fs.readFileSync('package.json','utf8'));
+              const deps=Object.keys({...(p.dependencies||{}),...(p.devDependencies||{})});
+              const missing=deps.filter(function(d){
+                try { JSON.parse(fs.readFileSync('node_modules/'+d+'/package.json','utf8')); return false; }
+                catch (e) { return true; }
+              });
+              console.log(missing.join(' '));
+            " 2>/dev/null
+          }
+
+          # Single package manager for every install in this build.
+          install_pkgs() {
+            if [ "\${PM:-npm}" = "npm" ]; then
+              npm install --no-audit --no-fund $1 || npm install --no-audit --no-fund --legacy-peer-deps $1 || true
+            else
+              \${ADD_CMD:-npm install} $1 || true
+            fi
+          }
+
+          REPAIRS=""
+          MISSING="$(missing_list)"
+          if [ -n "$MISSING" ]; then
+            log "[deps] Missing or unreadable in node_modules:$MISSING"
+            # A package folder that exists but cannot be read is broken — drop it
+            # so the reinstall is clean instead of a no-op.
+            for m in $MISSING; do if [ -d "node_modules/$m" ]; then rm -rf "node_modules/$m"; fi; done
+            log "[deps] Repair 1/3 — installing the missing set with \${PM:-npm}"
+            install_pkgs "$MISSING"
+            REPAIRS="$REPAIRS installed:$(echo $MISSING | tr ' ' ',')"
+            MISSING="$(missing_list)"
+          fi
+          if [ -n "$MISSING" ]; then
+            log "[deps] Repair 2/2 — clean reinstall with \${PM:-npm}"
+            rm -rf node_modules
+            \${INSTALL_CMD:-npm install --no-audit --no-fund} || true
+            REPAIRS="$REPAIRS clean-reinstall"
+            MISSING="$(missing_list)"
+          fi
+          [ -z "$MISSING" ] || fail "These declared packages could not be installed with \${PM:-npm} after repair:$MISSING"
+          log "[deps] All declared dependencies and devDependencies resolve inside node_modules"
+
+          # Health check (missing / invalid / duplicated / peer-incompatible).
+          case "\${PM:-npm}" in
+            bun) bun pm ls > /tmp/dep-health.txt 2>&1 || true ;;
+            pnpm) pnpm list --depth 1 > /tmp/dep-health.txt 2>&1 || true ;;
+            yarn) yarn list --depth=1 > /tmp/dep-health.txt 2>&1 || true ;;
+            *) npm ls --all --json > /tmp/dep-health.json 2>/dev/null || true ;;
+          esac
+          DUPES=""
+          if [ -s /tmp/dep-health.json ]; then
+            node -e "
+              const fs=require('fs');
+              let tree; try { tree=JSON.parse(fs.readFileSync('/tmp/dep-health.json','utf8')); } catch (e) { console.log('[deps] health: npm ls output unparsable'); process.exit(0); }
+              const problems=[]; const versions={};
+              (function walk(node, path){
+                const deps=node.dependencies||{};
+                for (const name of Object.keys(deps)) {
+                  const d=deps[name]; const here=path+' > '+name;
+                  if (d.missing) problems.push('MISSING '+here);
+                  if (d.invalid) problems.push('INVALID '+here+' ('+(d.invalid===true?'version conflict':d.invalid)+')');
+                  for (const pr of (d.problems||[])) problems.push('PROBLEM '+here+': '+String(pr).slice(0,160));
+                  if (d.version) { versions[name]=versions[name]||new Set(); versions[name].add(d.version); }
+                  walk(d, here);
+                }
+              })(tree, 'root');
+              const dups=Object.keys(versions).filter(function(k){return versions[k].size>1;});
+              console.log('[deps] health problems: '+(problems.length||'none'));
+              problems.slice(0,40).forEach(function(p){ console.log('  '+p); });
+              console.log('[deps] duplicated packages (multiple versions): '+(dups.length?dups.slice(0,25).join(', '):'none'));
+              if (dups.length) console.log('DEP_DUPES=1');
+            " > /tmp/dep-health-report.txt 2>&1 || true
+            cat /tmp/dep-health-report.txt | grep -v '^DEP_DUPES=' | tee -a "$REPORT"
+            if grep -q '^DEP_DUPES=1' /tmp/dep-health-report.txt; then DUPES=1; fi
+          elif [ -f /tmp/dep-health.txt ]; then
+            head -n 40 /tmp/dep-health.txt | tee -a "$REPORT"
+          fi
+          if [ -n "$DUPES" ]; then
+            log "[deps] Deduplicating (auto-repair)"
+            case "\${PM:-npm}" in
+              pnpm) pnpm dedupe >/dev/null 2>&1 || true ;;
+              yarn) yarn dedupe >/dev/null 2>&1 || true ;;
+              bun) : ;;
+              *) npm dedupe --no-audit --no-fund >/dev/null 2>&1 || true ;;
+            esac
+            log "REPAIR: deduplicated packages with \${PM:-npm}"
+            REPAIRS="$REPAIRS dedupe"
+            MISSING="$(missing_list)"
+            [ -z "$MISSING" ] || install_pkgs "$MISSING"
+          fi
+
+          # --- Capacitor compatibility (official rules: MAJOR must match) ---
+          # Minor/patch differences across plugins are always allowed.
+          cap_compat() {
+            node -e "
+              const fs=require('fs');
+              const read=(p)=>{ try { return JSON.parse(fs.readFileSync(p,'utf8')); } catch (e) { return null; } };
+              const pkg=read('package.json')||{};
+              const deps={...(pkg.dependencies||{}),...(pkg.devDependencies||{})};
+              const inst=(n)=>read('node_modules/'+n+'/package.json');
+              const majorOf=(v)=>parseInt(String(v||'').split('.')[0],10);
+              // Real range evaluation — only the MAJOR has to be compatible.
+              const peerOk=(range,coreMaj)=>{
+                if (!range || range.indexOf('*')>=0 || range==='latest') return true;
+                for (const part of String(range).split('||')) {
+                  const comps=part.trim().split(/\\s+/).filter(Boolean);
+                  if (!comps.length) continue;
+                  let ok=true;
+                  for (const c of comps) {
+                    const m=c.match(/^(>=|<=|>|<|\\^|~|=)?\\s*v?(\\d+)/);
+                    if (!m) { ok=false; break; }
+                    const op=m[1]||'=';
+                    const maj=parseInt(m[2],10);
+                    if (op==='>='||op==='>') ok=ok&&coreMaj>=maj;
+                    else if (op==='<=') ok=ok&&coreMaj<=maj;
+                    else if (op==='<') ok=ok&&coreMaj<maj;
+                    else ok=ok&&coreMaj===maj;
+                  }
+                  if (ok) return true;
+                }
+                return false;
+              };
+              const core=inst('@capacitor/core');
+              if (!core) { console.log('CAP_ERR:@capacitor/core is not installed'); process.exit(0); }
+              const coreMaj=majorOf(core.version);
+              const inventory=['@capacitor/core@'+core.version];
+              const fixes=[]; const errs=[];
+              for (const n of ['@capacitor/cli','@capacitor/android','@capacitor/ios']) {
+                const m=inst(n);
+                if (!m) {
+                  if (n==='@capacitor/ios') continue;
+                  fixes.push(n+'@^'+coreMaj); errs.push(n+' is not installed'); continue;
+                }
+                inventory.push(n+'@'+m.version);
+                if (majorOf(m.version)!==coreMaj) {
+                  fixes.push(n+'@^'+coreMaj);
+                  errs.push(n+' is v'+m.version+' but @capacitor/core is v'+core.version+' (major must match)');
+                }
+              }
+              const skip=['@capacitor/core','@capacitor/cli','@capacitor/android','@capacitor/ios','@capacitor/assets'];
+              const pluginNames=Object.keys(deps).filter((d)=>/^(@capacitor\\/|@capacitor-community\\/|capacitor-)/.test(d)&&skip.indexOf(d)<0);
+              for (const n of pluginNames) {
+                const m=inst(n);
+                if (!m) { fixes.push(n+'@^'+coreMaj); errs.push(n+' is declared but not installed'); continue; }
+                inventory.push(n+'@'+m.version);
+                const peer=(m.peerDependencies||{})['@capacitor/core'];
+                // minor/patch differences are always fine — only a peer major
+                // that excludes the installed core is a real incompatibility.
+                if (peer && !peerOk(peer,coreMaj)) {
+                  fixes.push(n+'@^'+coreMaj);
+                  errs.push(n+'@'+m.version+' expects @capacitor/core '+peer+' but core is v'+core.version);
+                }
+              }
+              console.log('CAP_INV:'+inventory.join(', '));
+              fixes.forEach((f)=>console.log('CAP_FIX:'+f));
+              errs.forEach((e)=>console.log('CAP_ERR:'+e));
+            " > /tmp/cap-compat.txt 2>&1 || true
+          }
+
+          cap_compat
+          sed -n 's/^CAP_INV:/[deps] Capacitor packages: /p' /tmp/cap-compat.txt | tee -a "$REPORT"
+          if grep -q '^CAP_FIX:' /tmp/cap-compat.txt; then
+            FIXES="$(sed -n 's/^CAP_FIX://p' /tmp/cap-compat.txt | tr '\\n' ' ')"
+            sed -n 's/^CAP_ERR:/[deps] Capacitor incompatibility: /p' /tmp/cap-compat.txt | tee -a "$REPORT"
+            log "DEPENDENCY_REPAIRED: realigning Capacitor packages to core major: $FIXES"
+            install_pkgs "$FIXES"
+            REPAIRS="$REPAIRS cap-realign:$(echo $FIXES | tr ' ' ',')"
+            cap_compat
+            sed -n 's/^CAP_INV:/[deps] Capacitor packages after repair: /p' /tmp/cap-compat.txt | tee -a "$REPORT"
+          fi
+          if grep -q '^CAP_ERR:' /tmp/cap-compat.txt; then
+            sed -n 's/^CAP_ERR:/[deps] Unresolved: /p' /tmp/cap-compat.txt | tee -a "$REPORT"
+            fail "$(sed -n 's/^CAP_ERR://p' /tmp/cap-compat.txt | head -n 1)"
+          fi
+          log "[deps] Capacitor compatibility OK (major versions aligned; minor/patch differences allowed)"
+          if [ -n "$REPAIRS" ]; then log "DEPENDENCY_REPAIRED:$REPAIRS"; fi
+
+          # Toolchain: Java, Android SDK, build-tools, licences.
+          JAVA_MAJ="$(java -version 2>&1 | head -n 1 | sed -n 's/.*version "\\([0-9][0-9]*\\).*/\\1/p')"
+          log "[toolchain] Java major: \${JAVA_MAJ:-unknown}"
+          if [ -n "$JAVA_MAJ" ] && [ "$JAVA_MAJ" -lt 17 ]; then
+            fail "Java 17 or newer is required for the Android build (found $JAVA_MAJ)."
+          fi
+          SDK="\${ANDROID_HOME:-\${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          [ -d "$SDK" ] || fail "Android SDK not found (ANDROID_HOME=\${ANDROID_HOME:-unset})."
+          [ -d "$SDK/platform-tools" ] || fail "Android SDK platform-tools are missing at $SDK/platform-tools."
+          BT="$(ls -d $SDK/build-tools/* 2>/dev/null | sort -V | tail -n 1 || true)"
+          [ -n "$BT" ] || fail "No Android build-tools are installed under $SDK/build-tools."
+          log "[toolchain] Android SDK: $SDK (build-tools $(basename "$BT"))"
+          log "[toolchain] Accepted licence files: $(ls "$SDK/licenses" 2>/dev/null | wc -l)"
+          log "[deps] Dependency and toolchain verification passed"
+
+
+
+      - name: Build web assets
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          BUILD_STARTED_AT="$(date +%s)"
+          if node -e "process.exit((require('./package.json').scripts||{}).build?0:1)" 2>/dev/null; then
+            # Clean only generated output so a failed build can never be masked
+            # by stale assets from the uploaded zip.
+            for stale in dist build out .output .nuxt .svelte-kit/output; do
+              if [ -d "$stale" ]; then rm -rf "$stale"; log "[web] Cleaned stale output: $stale"; fi
+            done
+            if $RUN_CMD build; then
+              log "[web] Build script completed"
+            else
+              log "PREBUILD_VALIDATION_FAILED: WEB_BUILD_FAILED"
+              log "  Command: \${RUN_CMD:-npm run} build"
+              log "  Package manager: \${PM:-npm}   Node: $(node --version)"
+              echo "::error::The project's web build script failed. Stale web assets are never reused — fix the build script and retry."
+              exit 1
+            fi
+          else
+            log "[web] No build script — using shipped web assets"
+          fi
+          # Resolve the real web output dir: explicit config, then framework
+          # mapping, then any directory that genuinely contains the build.
+          RESOLVED=""
+          if [ -n "\${WEB_DIR:-}" ] && [ -f "$WEB_DIR/index.html" ]; then RESOLVED="$WEB_DIR"; fi
+          if [ -z "$RESOLVED" ]; then
+            case "\${DETECTED_FRAMEWORK:-}" in
+              tanstack-start|nuxt) FW_DIRS=".output/public" ;;
+              next) FW_DIRS="out" ;;
+              astro|vite|vue|react|ionic) FW_DIRS="dist" ;;
+              sveltekit) FW_DIRS="build .svelte-kit/output/client" ;;
+              angular) FW_DIRS="$(ls -d dist/*/browser dist/* 2>/dev/null | tr '\\n' ' ')" ;;
+              remix) FW_DIRS="build/client" ;;
+              *) FW_DIRS="" ;;
+            esac
+            for c in $FW_DIRS; do
+              c="\${c%/}"
+              if [ -z "$RESOLVED" ] && [ -f "$c/index.html" ]; then RESOLVED="$c"; log "[web] Framework output (\${DETECTED_FRAMEWORK:-unknown}): $c"; fi
+            done
+          fi
+          if [ -z "$RESOLVED" ]; then
+            for c in dist build out www .output/public dist/spa dist/browser build/client .svelte-kit/output/client .nuxt/dist/client app/build public; do
+              if [ -z "$RESOLVED" ] && [ -f "$c/index.html" ]; then RESOLVED="$c"; fi
+            done
+          fi
+          if [ -z "$RESOLVED" ]; then
+            for c in $(ls -d dist/*/browser dist/*/ build/*/ 2>/dev/null); do
+              if [ -z "$RESOLVED" ] && [ -f "\${c%/}/index.html" ]; then RESOLVED="\${c%/}"; fi
+            done
+          fi
+          if [ -z "$RESOLVED" ]; then
+            CANDIDATE="$(find . -maxdepth 3 -name index.html -not -path './node_modules/*' -not -path './android/*' -not -path './ios/*' -not -path './src/*' 2>/dev/null | head -n 1)"
+            if [ -n "$CANDIDATE" ]; then RESOLVED="$(dirname "$CANDIDATE")"; RESOLVED="\${RESOLVED#./}"; fi
+          fi
+          if [ -z "$RESOLVED" ]; then
+            log "PREBUILD_VALIDATION_FAILED: No web build output containing index.html could be found."
+            log "  Framework detected: \${DETECTED_FRAMEWORK:-unknown}"
+            log "  Package manager:    \${PM:-npm}"
+            log "  Build command run:  \${RUN_CMD:-npm run} build"
+            log "  Configured webDir:  \${WEB_DIR:-none}"
+            log "  Directories probed: dist build out www public .output/public dist/spa dist/browser build/client .svelte-kit/output/client .nuxt/dist/client"
+            log "  Project root contents:"
+            ls -la | tee -a "$REPORT"
+            echo "::error::No web build output containing index.html was produced. Check the build script and web output directory."
+            exit 1
+          fi
+          log "[web] Web directory: $RESOLVED"
+          # The build output must be real: non-empty, with JS/CSS assets, and
+          # newer than this step when a build script actually ran.
+          if [ ! -s "$RESOLVED/index.html" ]; then
+            echo "::error::$RESOLVED/index.html is empty — the web build did not produce usable output."
+            log "PREBUILD_VALIDATION_FAILED: WEB_OUTPUT_EMPTY ($RESOLVED/index.html)"
+            exit 1
+          fi
+          ASSET_COUNT="$(find "$RESOLVED" -type f \\( -name '*.js' -o -name '*.mjs' -o -name '*.css' \\) 2>/dev/null | wc -l)"
+          log "[web] Output files: $(find "$RESOLVED" -type f | wc -l) (JS/CSS assets: $ASSET_COUNT)"
+          if [ "$ASSET_COUNT" -eq 0 ]; then
+            echo "::error::No JavaScript or CSS assets found in $RESOLVED — the web build output looks incomplete."
+            log "PREBUILD_VALIDATION_FAILED: WEB_OUTPUT_NO_ASSETS ($RESOLVED)"
+            exit 1
+          fi
+          echo "RESOLVED_WEB_DIR=$RESOLVED" >> "$GITHUB_ENV"
+
+
+      - name: Inject OAuth callback diagnostics
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          if [ -z "\${DIAGNOSTIC_ENDPOINT:-}" ] || [ -z "\${DIAGNOSTIC_TOKEN:-}" ]; then
+            log "[oauth-diagnostics] No diagnostics endpoint configured — skipping web runtime instrumentation"
+            exit 0
+          fi
+          INDEX="$RESOLVED_WEB_DIR/index.html"
+          if [ ! -f "$INDEX" ]; then
+            log "[oauth-diagnostics] index.html not found at $INDEX — skipping web runtime instrumentation"
+            exit 0
+          fi
+          cat > /tmp/apkforge-oauth-diagnostics.js <<'JSEOF'
+          (function () {
+            var endpoint = '__APKFORGE_DIAGNOSTIC_ENDPOINT__';
+            var token = '__APKFORGE_DIAGNOSTIC_TOKEN__';
+            var buildId = '__APKFORGE_BUILD_ID__';
+            if (!endpoint || !token || window.__apkforgeOAuthDiagnostics) return;
+            window.__apkforgeOAuthDiagnostics = true;
+            var seen = Object.create(null);
+            function cleanUrl(value) {
+              try {
+                var url = new URL(String(value || ''));
+                var queryKeys = [];
+                url.searchParams.forEach(function (_, key) {
+                  if (!/token|secret|password|refresh|access/i.test(key)) queryKeys.push(key);
+                });
+                return {
+                  scheme: url.protocol.replace(':', ''),
+                  host: url.host,
+                  path: url.pathname,
+                  hasCode: url.searchParams.has('code'),
+                  hasError: url.searchParams.has('error'),
+                  hashKeys: url.hash ? url.hash.replace(/^#/, '').split('&').map(function (p) { return p.split('=')[0]; }).filter(function (k) { return !/token|secret|password|refresh|access/i.test(k); }).slice(0, 20) : [],
+                  queryKeys: queryKeys.slice(0, 20)
+                };
+              } catch (err) {
+                return { malformed: true, message: String(err && err.message || err || 'parse error') };
+              }
+            }
+            function send(stage, extra) {
+              try {
+                var body = JSON.stringify({ token: token, buildId: buildId, stage: stage, at: new Date().toISOString(), extra: extra || {} });
+                if (navigator.sendBeacon) {
+                  var blob = new Blob([body], { type: 'application/json' });
+                  if (navigator.sendBeacon(endpoint, blob)) return;
+                }
+                fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json' }, body: body, keepalive: true }).catch(function () {});
+              } catch (_) {}
+            }
+            send('web-runtime-loaded', { native: !!window.Capacitor, path: location.pathname });
+            window.addEventListener('error', function (event) {
+              send('window-error', { message: String(event.message || 'unknown'), source: event.filename ? String(event.filename).split('/').pop() : '', line: event.lineno || 0, col: event.colno || 0 });
+            });
+            window.addEventListener('unhandledrejection', function (event) {
+              var reason = event.reason;
+              send('unhandled-rejection', { message: String(reason && reason.message || reason || 'unknown') });
+            });
+            try {
+              var originalSetItem = Storage.prototype.setItem;
+              Storage.prototype.setItem = function (key, value) {
+                if (/auth-token|supabase|session/i.test(String(key || ''))) {
+                  send('session-storage-write', { key: String(key || '').slice(0, 96), bytes: String(value || '').length });
+                }
+                return originalSetItem.apply(this, arguments);
+              };
+            } catch (_) {}
+            try {
+              var originalFetch = window.fetch;
+              window.fetch = function (input, init) {
+                var url = typeof input === 'string' ? input : input && input.url;
+                var isToken = /\/auth\/v1\/token/i.test(String(url || ''));
+                if (isToken) send('exchangeCodeForSession-fetch-start', { endpoint: cleanUrl(url), method: (init && init.method) || 'POST' });
+                return originalFetch.apply(this, arguments).then(function (response) {
+                  if (isToken) send('exchangeCodeForSession-fetch-done', { status: response.status, ok: response.ok });
+                  return response;
+                }, function (err) {
+                  if (isToken) send('exchangeCodeForSession-fetch-throw', { message: String(err && err.message || err || 'fetch failed') });
+                  throw err;
+                });
+              };
+            } catch (_) {}
+            function hookAppPlugin() {
+              try {
+                var cap = window.Capacitor;
+                var app = cap && cap.Plugins && cap.Plugins.App;
+                if (!app && window.CapacitorApp) app = window.CapacitorApp;
+                if (app && app.addListener && !window.__apkforgeAppUrlOpenHooked) {
+                  window.__apkforgeAppUrlOpenHooked = true;
+                  app.addListener('appUrlOpen', function (event) {
+                    var info = cleanUrl(event && event.url);
+                    var key = [info.scheme, info.host, info.path, info.hasCode, info.hasError].join('|');
+                    send(seen[key] ? 'appUrlOpen-duplicate' : 'appUrlOpen', info);
+                    seen[key] = true;
+                  });
+                  send('appUrlOpen-listener-registered', {});
+                  return;
+                }
+              } catch (err) {
+                send('appUrlOpen-listener-error', { message: String(err && err.message || err || 'listener failed') });
+              }
+              setTimeout(hookAppPlugin, 500);
+            }
+            hookAppPlugin();
+          })();
+          JSEOF
+          node - <<'NODEEOF'
+          const fs = require('fs');
+          const indexPath = process.env.RESOLVED_WEB_DIR + '/index.html';
+          let html = fs.readFileSync(indexPath, 'utf8');
+          if (html.includes('__apkforgeOAuthDiagnostics')) {
+            console.log('[oauth-diagnostics] Runtime instrumentation already present');
+            process.exit(0);
+          }
+          let script = fs.readFileSync('/tmp/apkforge-oauth-diagnostics.js', 'utf8')
+            .replaceAll('__APKFORGE_DIAGNOSTIC_ENDPOINT__', process.env.DIAGNOSTIC_ENDPOINT || '')
+            .replaceAll('__APKFORGE_DIAGNOSTIC_TOKEN__', process.env.DIAGNOSTIC_TOKEN || '')
+            .replaceAll('__APKFORGE_BUILD_ID__', process.env.BUILD_ID || '');
+          const tag = '<script>' + script + '</script>';
+          html = /<\\/body>/i.test(html) ? html.replace(/<\\/body>/i, tag + '\\n</body>') : html + '\\n' + tag;
+          fs.writeFileSync(indexPath, html);
+          console.log('[oauth-diagnostics] Injected sanitized callback diagnostics into ' + indexPath);
+          NODEEOF
+          log "[oauth-diagnostics] Sanitized runtime diagnostics injected"
+
+      # One Node version for the whole build. APKForge raises the dispatched
+      # node_version to the Capacitor minimum before dispatch, so there is no
+      # mid-build toolchain switch to reason about.
+      - name: Verify native Node runtime
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { echo "PREBUILD_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
+          NATIVE_NODE_MAJOR="$(node -p "process.versions.node.split('.')[0]")"
+          log "[native-env] Node (same as web phase): $(node --version)"
+          CLI_REQ="$(node -e "try{const p=require('@capacitor/cli/package.json');const m=String((p.engines&&p.engines.node)||'').match(/(\\d+)/);console.log(m?m[1]:'')}catch(e){console.log('')}" 2>/dev/null || echo "")"
+          if [ -n "$CLI_REQ" ] && [ "$NATIVE_NODE_MAJOR" -lt "$CLI_REQ" ]; then
+            fail "The installed Capacitor CLI requires Node.js >=$CLI_REQ, but this build runs on $(node --version). Set .nvmrc / engines.node to $CLI_REQ or newer and rebuild."
+          fi
+          npx --no-install cap --version | tee -a "$REPORT" || fail "The locally installed Capacitor CLI cannot run on Node $(node --version)."
+
+      - name: Repair Capacitor configuration (webDir)
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { echo "PREBUILD_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
+          CAP="npx cap"
+
+          if [ ! -f "$RESOLVED_WEB_DIR/index.html" ]; then
+            fail "No index.html in the resolved web directory ('$RESOLVED_WEB_DIR'). The web build did not produce usable assets."
+          fi
+
+          CFG=""
+          for f in capacitor.config.ts capacitor.config.js capacitor.config.mjs capacitor.config.cjs capacitor.config.json; do
+            if [ -z "$CFG" ] && [ -f "$f" ]; then CFG="$f"; fi
+          done
+          if [ -z "$CFG" ]; then
+            log "[config] No capacitor config — running cap init (auto-repair)"
+            $CAP init "$APP_NAME" "$BUNDLE_ID" --web-dir="$RESOLVED_WEB_DIR" || fail "capacitor init failed for bundle id $BUNDLE_ID."
+            for f in capacitor.config.ts capacitor.config.js capacitor.config.mjs capacitor.config.cjs capacitor.config.json; do
+              if [ -z "$CFG" ] && [ -f "$f" ]; then CFG="$f"; fi
+            done
+          fi
+          [ -n "$CFG" ] || fail "Capacitor config could not be created."
+          log "[config] Capacitor config: $CFG"
+
+          cat > /tmp/apkforge-fix-webdir.cjs <<'NODEEOF'
+          const fs = require('fs');
+          const file = process.argv[2];
+          const web = process.argv[3];
+          let src = fs.readFileSync(file, 'utf8');
+          let declared = null;
+          let repaired = false;
+          if (file.endsWith('.json')) {
+            const j = JSON.parse(src);
+            declared = j.webDir || null;
+            if (declared !== web) { j.webDir = web; fs.writeFileSync(file, JSON.stringify(j, null, 2)); repaired = true; }
+          } else {
+            const m = src.match(/webDir\\s*:\\s*['"\\\`]([^'"\\\`]+)['"\\\`]/);
+            declared = m ? m[1] : null;
+            if (m && declared !== web) {
+              src = src.replace(/webDir\\s*:\\s*['"\\\`][^'"\\\`]+['"\\\`]/, "webDir: '" + web + "'");
+              fs.writeFileSync(file, src); repaired = true;
+            } else if (!m) {
+              const anchor = src.match(/appId\\s*:\\s*['"\\\`][^'"\\\`]+['"\\\`]\\s*,/);
+              if (anchor) {
+                src = src.replace(anchor[0], anchor[0] + "\\n  webDir: '" + web + "',");
+                fs.writeFileSync(file, src); repaired = true;
+              }
+            }
+          }
+          console.log('[config] Declared webDir: ' + (declared || 'none'));
+          console.log('[config] Resolved webDir: ' + web);
+          console.log(repaired ? '[config] webDir repaired automatically' : '[config] webDir already correct');
+          const env = process.env.GITHUB_ENV;
+          if (env) {
+            fs.appendFileSync(env, 'DECLARED_WEB_DIR=' + (declared || '') + '\\n');
+            if (repaired) fs.appendFileSync(env, 'APKFORGE_REPAIRS=' + ((process.env.APKFORGE_REPAIRS ? process.env.APKFORGE_REPAIRS + ',' : '') + file) + '\\n');
+          }
+          NODEEOF
+          node /tmp/apkforge-fix-webdir.cjs "$CFG" "$RESOLVED_WEB_DIR" | tee -a "$REPORT"
+          echo "CAP_CONFIG_PATH=$CFG" >> "$GITHUB_ENV"
+
+      - name: Ensure required Capacitor plugins
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}")"
+
+          # Signals are collected once from the project sources + package.json.
+          # A plugin is required when the source imports it directly OR when a
+          # library/API that needs it natively is present (e.g. an OAuth SDK
+          # cannot return to the app without Browser + App).
+          SRC_HITS=/tmp/plugin-signals.txt
+          : > "$SRC_HITS"
+          # -h -o: record the matched TOKENS, not the file names. (Matching file
+          # names made every "@capacitor/x" probe below silently fail, which is
+          # how a project that imports @capacitor/preferences could reach cap
+          # sync without the package installed.)
+          grep -rIhoE --exclude-dir=node_modules --exclude-dir=android --exclude-dir=ios --exclude-dir=.git \\
+            "@capacitor/[a-z-]+|@supabase/supabase-js|firebase/auth|@auth0/|@clerk/|appwrite|amazon-cognito|oidc-client|signInWithOAuth|signInWithRedirect|loginWithRedirect|authorize\\(|oauth|getUserMedia|navigator\\.geolocation|localStorage|serviceWorker|Notification\\.requestPermission|<input[^>]+type=[\\"']file[\\"']|qr|barcode|biometric|webauthn" . 2>/dev/null \\
+            | sort -u > "$SRC_HITS" || true
+
+          # Bundlers rewrite "@capacitor/preferences" out of the built output,
+          # but Capacitor's registerPlugin('<Name>') call survives minification.
+          # Map those runtime plugin names back to their packages so a project
+          # shipping only built assets still gets its native plugins installed.
+          if [ -n "$RESOLVED_WEB_DIR" ] && [ -d "$RESOLVED_WEB_DIR" ]; then
+            grep -rIhoE "registerPlugin\\(\\s*[\\"'][A-Za-z0-9_]+[\\"']" "$RESOLVED_WEB_DIR" 2>/dev/null \\
+              | grep -oE "[\\"'][A-Za-z0-9_]+[\\"']" | tr -d "\\"'" | sort -u > /tmp/plugin-runtime-names.txt || true
+            while read -r PNAME; do
+              [ -n "$PNAME" ] || continue
+              case "$PNAME" in
+                Preferences) echo "@capacitor/preferences" ;;
+                Browser) echo "@capacitor/browser" ;;
+                App) echo "@capacitor/app" ;;
+                Camera) echo "@capacitor/camera" ;;
+                Geolocation) echo "@capacitor/geolocation" ;;
+                Filesystem) echo "@capacitor/filesystem" ;;
+                PushNotifications) echo "@capacitor/push-notifications" ;;
+                LocalNotifications) echo "@capacitor/local-notifications" ;;
+                Network) echo "@capacitor/network" ;;
+                Haptics) echo "@capacitor/haptics" ;;
+                StatusBar) echo "@capacitor/status-bar" ;;
+                SplashScreen) echo "@capacitor/splash-screen" ;;
+                Share) echo "@capacitor/share" ;;
+                Toast) echo "@capacitor/toast" ;;
+                Device) echo "@capacitor/device" ;;
+                Clipboard) echo "@capacitor/clipboard" ;;
+                Keyboard) echo "@capacitor/keyboard" ;;
+                ActionSheet) echo "@capacitor/action-sheet" ;;
+                Dialog) echo "@capacitor/dialog" ;;
+                ScreenOrientation) echo "@capacitor/screen-orientation" ;;
+                TextZoom) echo "@capacitor/text-zoom" ;;
+                Motion) echo "@capacitor/motion" ;;
+              esac
+            done < /tmp/plugin-runtime-names.txt >> "$SRC_HITS"
+            sort -u -o "$SRC_HITS" "$SRC_HITS"
+            log "[plugins] Runtime plugin names in built assets: $(tr '\\n' ' ' < /tmp/plugin-runtime-names.txt)"
+          fi
+          log "[plugins] Capacitor packages referenced by the project: $(grep -oE '@capacitor/[a-z-]+' "$SRC_HITS" | sort -u | tr '\\n' ' ')"
+          DEPS_TXT="$(node -e "const d=require('./package.json');console.log(Object.keys({...(d.dependencies||{}),...(d.devDependencies||{})}).join(' '))" 2>/dev/null || echo '')"
+          sig() { grep -qiE "$1" "$SRC_HITS" 2>/dev/null || echo "$DEPS_TXT" | grep -qiE "$1"; }
+
+          OAUTH_SIGNAL=""
+          if sig "@supabase/supabase-js|firebase|@auth0/|@clerk/|appwrite|cognito|oidc|next-auth|signinwithoauth|signinwithredirect|loginwithredirect|oauth"; then
+            OAUTH_SIGNAL=1
+            log "[plugins] OAuth/auth SDK signal detected — Browser + App are required for native callbacks"
+          fi
+
+          declared() {
+            node -e "const d=require('./package.json');const a={...(d.dependencies||{}),...(d.devDependencies||{})};process.exit(a['$1']?0:1)" 2>/dev/null
+          }
+          need() {
+            # need <plugin-suffix> <extra-signal-regex>
+            PKG="@capacitor/$1"
+            declared "$PKG" && return 1
+            grep -qF "$PKG" "$SRC_HITS" 2>/dev/null && return 0
+            sig "$2" && return 0
+            return 1
+          }
+
+          ADDED=""
+          add_plugin() {
+            case " $ADDED " in *" $1 "*) return 0 ;; esac
+            SPEC="$1"
+            if [ -n "$CORE_MAJ" ]; then SPEC="$1@^$CORE_MAJ"; fi
+            if \${ADD_CMD:-npm install} "$SPEC" >/dev/null 2>&1 || \${ADD_CMD:-npm install} "$1" >/dev/null 2>&1; then
+              ADDED="$ADDED $1"
+              log "PLUGIN_AUTOINSTALL: $1 (required by detected project capabilities)"
+            else
+              log "[plugins] WARNING: could not auto-install $1"
+            fi
+          }
+
+          # app + browser are installed whenever the project has any OAuth signal:
+          # without them the provider callback stays in the system browser.
+          if [ -n "$OAUTH_SIGNAL" ]; then
+            declared "@capacitor/app" || add_plugin "@capacitor/app"
+            declared "@capacitor/browser" || add_plugin "@capacitor/browser"
+          fi
+          # @capacitor/app underpins lifecycle + appUrlOpen deep-link delivery.
+          declared "@capacitor/app" || add_plugin "@capacitor/app"
+
+          if need browser "oauth|signinwithoauth|loginwithredirect|window\\.open|opensystembrowser"; then add_plugin "@capacitor/browser"; fi
+          if need camera "getusermedia|<input[^>]+type=.file|qr|barcode|scanner|photo"; then add_plugin "@capacitor/camera"; fi
+          if need geolocation "navigator\\.geolocation|geolocation|maps"; then add_plugin "@capacitor/geolocation"; fi
+          if need filesystem "filesystem|downloadfile|writefile|blob|filereader"; then add_plugin "@capacitor/filesystem"; fi
+          if need preferences "localstorage|sessionstorage|persist"; then add_plugin "@capacitor/preferences"; fi
+          if need push-notifications "notification\\.requestpermission|firebase/messaging|onesignal|push"; then add_plugin "@capacitor/push-notifications"; fi
+          if need network "navigator\\.online|offline|network"; then add_plugin "@capacitor/network"; fi
+          if need haptics "haptic|vibrate"; then add_plugin "@capacitor/haptics"; fi
+          if need status-bar "statusbar|safe-area"; then add_plugin "@capacitor/status-bar"; fi
+          if need splash-screen "splash"; then add_plugin "@capacitor/splash-screen"; fi
+
+          # Catch-all: any @capacitor/* package the project actually references
+          # (source import or runtime registerPlugin name) that is not declared
+          # in package.json gets installed too — no per-plugin allowlist.
+          for PKG in $(grep -oE '@capacitor/[a-z-]+' "$SRC_HITS" 2>/dev/null | sort -u); do
+            case "$PKG" in
+              @capacitor/core|@capacitor/cli|@capacitor/android|@capacitor/ios|@capacitor/assets) continue ;;
+            esac
+            declared "$PKG" || add_plugin "$PKG"
+          done
+
+          if [ -z "$ADDED" ]; then log "[plugins] No additional Capacitor plugins required"; fi
+          log "[plugins] Auto-installed:\${ADDED:- none}"
+          echo "APKFORGE_AUTO_PLUGINS=$(echo $ADDED | tr ' ' ',')" >> "$GITHUB_ENV"
+
+      - name: Generate or repair native Android project
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { echo "PREBUILD_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
+          CAP="npx cap"
+
+          if [ -d android ] && { [ ! -f android/gradlew ] || [ ! -f android/app/src/main/AndroidManifest.xml ] || [ ! -f android/capacitor.settings.gradle ]; }; then
+            log "[native] Existing android/ project is incomplete — regenerating (auto-repair)"
+            rm -rf android
+          fi
+          if [ ! -d android ]; then
+            log "[native] Adding Android platform (cap add android)"
+            # cap add runs copy+update internally; webDir was repaired in the
+            # previous step so copy has real assets to work with. Plugin state
+            # (capacitor.plugins.json) is NOT inspected here — only after cap sync.
+            if ! $CAP add android; then
+              if [ -f android/gradlew ] && [ -f android/app/src/main/AndroidManifest.xml ]; then
+                log "[native] cap add reported an error but the native project scaffold exists — continuing, cap sync will repair it"
+              else
+                fail "cap add android failed — the native Android project could not be generated (webDir '$RESOLVED_WEB_DIR')."
+              fi
+            fi
+          fi
+          [ -f android/gradlew ] || fail "Native Android project is missing android/gradlew after generation."
+          log "[native] Native Android project ready"
+
+
+      - name: Sync icons and Capacitor plugins
+        working-directory: project
+        env:
+          LOGO_URL: \${{ github.event.inputs.logo_url }}
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          fail() { echo "PREBUILD_VALIDATION_FAILED: $1" | tee -a "$REPORT"; echo "::error::$1"; exit 1; }
+          CAP="npx cap"
+
+          mkdir -p resources
+          if [ -n "$LOGO_URL" ]; then
+            curl -sSL --fail -o resources/icon.png "$LOGO_URL" && log "[icon] Using uploaded app icon"
+          elif [ ! -f resources/icon.png ]; then
+            for candidate in public/icon.png public/logo.png public/apple-touch-icon.png public/favicon.png src/assets/icon.png src/assets/logo.png assets/icon.png assets/logo.png icon.png logo.png; do
+              if [ -f "$candidate" ]; then cp "$candidate" resources/icon.png; log "[icon] Auto-detected icon at $candidate"; break; fi
+            done
+          fi
+          if [ -f resources/icon.png ]; then
+            \${ADD_CMD:-npm install} -D @capacitor/assets >/dev/null 2>&1 || \${ADD_CMD:-npm install} @capacitor/assets >/dev/null 2>&1 || true
+            npx @capacitor/assets generate --android --iconBackgroundColor '#ffffff' --iconBackgroundColorDark '#000000' \\
+              && log "[icon] Native icon/splash resources generated" \\
+              || log "[icon] WARNING: asset generation failed — keeping default Capacitor icon"
+          else
+            log "[icon] No icon supplied or detected — using Capacitor default"
+          fi
+
+          # cap sync output is captured verbatim so the Browser plugin trace can
+          # prove whether sync actually registered the native plugins.
+          if $CAP sync android > /tmp/cap-sync.log 2>&1; then
+            cat /tmp/cap-sync.log | tee -a "$REPORT"
+            echo "CAP_SYNC_EXIT=0" >> "$GITHUB_ENV"
+          else
+            cat /tmp/cap-sync.log | tee -a "$REPORT"
+            log "REPAIR: first cap sync failed — reinstalling dependencies with \${PM:-npm} and retrying"
+            \${INSTALL_CMD:-npm install --no-audit --no-fund}
+            if $CAP sync android > /tmp/cap-sync-retry.log 2>&1; then
+              cat /tmp/cap-sync-retry.log | tee -a "$REPORT"
+              echo "CAP_SYNC_EXIT=0-after-retry" >> "$GITHUB_ENV"
+            else
+              cat /tmp/cap-sync-retry.log | tee -a "$REPORT"
+              echo "CAP_SYNC_EXIT=failed" >> "$GITHUB_ENV"
+              fail "cap sync android failed. Native plugins could not be synchronized."
+            fi
+          fi
+          log "[sync] cap sync android completed"
+
+          PLUGINS_JSON="android/app/src/main/assets/capacitor.plugins.json"
+          CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null)"
+
+
+          # ---------------------------------------------------------------
+          # Plugin audit. Runs ONLY after cap sync. A package counts as a
+          # native Android plugin when its own package.json declares a
+          # capacitor.android block OR it ships android/src/main sources —
+          # never merely because its name looks like a plugin. Registration is
+          # proven structurally (Gradle include slug, Gradle project
+          # dependency, capacitor.plugins.json class list), not by substring.
+          # ---------------------------------------------------------------
+          cat > /tmp/apkforge-plugin-audit.cjs <<'NODEEOF'
+          const fs = require('fs');
+          const path = require('path');
+          const root = process.cwd();
+          const skip = new Set(['@capacitor/core', '@capacitor/cli', '@capacitor/android', '@capacitor/ios', '@capacitor/assets']);
+          const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { return null; } };
+          const readText = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch (e) { return ''; } };
+          const slugOf = (name) => name.replace(/^@/, '').replace(/\\//g, '-');
+          // True when the package ships an @CapacitorPlugin-annotated class:
+          // those MUST appear in capacitor.plugins.json or the Android bridge
+          // never registers them and the JS call fails with
+          // "<X> plugin is not implemented on android".
+          const shipsPluginClass = (dir) => {
+            const stack = [path.join(dir, 'android', 'src', 'main')];
+            while (stack.length) {
+              const cur = stack.pop();
+              let entries = [];
+              try { entries = fs.readdirSync(cur, { withFileTypes: true }); } catch (e) { continue; }
+              for (const en of entries) {
+                const full = path.join(cur, en.name);
+                if (en.isDirectory()) { stack.push(full); continue; }
+                if (!/\\.(java|kt)$/.test(en.name)) continue;
+                if (readText(full).indexOf('@CapacitorPlugin') >= 0) return true;
+              }
+            }
+            return false;
+          };
+
+          const candidates = new Set();
+          const rootPkg = readJson(path.join(root, 'package.json')) || {};
+          Object.keys(Object.assign({}, rootPkg.dependencies, rootPkg.devDependencies)).forEach((d) => candidates.add(d));
+          const scanDir = (dir, prefix) => {
+            let entries = [];
+            try { entries = fs.readdirSync(dir); } catch (e) { return; }
+            for (const en of entries) {
+              if (en.charAt(0) === '.') continue;
+              if (prefix === '' && en.charAt(0) === '@') continue;
+              candidates.add(prefix + en);
+            }
+          };
+          scanDir(path.join(root, 'node_modules', '@capacitor'), '@capacitor/');
+          scanDir(path.join(root, 'node_modules', '@capacitor-community'), '@capacitor-community/');
+          scanDir(path.join(root, 'node_modules', '@capgo'), '@capgo/');
+          scanDir(path.join(root, 'node_modules'), '');
+
+          // Only top-level node_modules copies count; nested duplicates are never
+          // resolved by Capacitor and must not fail the build.
+          const plugins = [];
+          for (const name of candidates) {
+            if (skip.has(name)) continue;
+            const dir = path.join(root, 'node_modules', name);
+            const pkg = readJson(path.join(dir, 'package.json'));
+            if (!pkg) continue;
+            const declaresAndroid = !!(pkg.capacitor && pkg.capacitor.android);
+            const hasAndroidSources = fs.existsSync(path.join(dir, 'android', 'src', 'main'));
+            if (!declaresAndroid && !hasAndroidSources) continue;
+            plugins.push({
+              name: name,
+              slug: slugOf(name),
+              declared: !!(rootPkg.dependencies || {})[name] || !!(rootPkg.devDependencies || {})[name],
+              needsJson: shipsPluginClass(dir),
+            });
+          }
+          plugins.sort((a, b) => a.name.localeCompare(b.name));
+
+          const settings = readText(path.join(root, 'android', 'capacitor.settings.gradle'));
+          const buildGradle = readText(path.join(root, 'android', 'app', 'capacitor.build.gradle'));
+          const pluginsJsonPath = path.join(root, 'android', 'app', 'src', 'main', 'assets', 'capacitor.plugins.json');
+          const pluginsJsonRaw = readText(pluginsJsonPath);
+          let pluginsJson = [];
+          try { pluginsJson = JSON.parse(pluginsJsonRaw || '[]'); } catch (e) { pluginsJson = []; }
+          const jsonPkgs = new Set(pluginsJson.map((e) => (e && e.pkg) || '').filter(Boolean));
+
+          const includeSlugs = new Set();
+          const includeRe = /include\\s+'([^']+)'/g;
+          let m;
+          while ((m = includeRe.exec(settings)) !== null) includeSlugs.add(m[1].replace(/^:/, ''));
+          const depSlugs = new Set();
+          const depRe = /project\\(['":]+([^'")]+)['"]?\\)/g;
+          while ((m = depRe.exec(buildGradle)) !== null) depSlugs.add(m[1].replace(/^:/, ''));
+
+          const rows = [];
+          const missing = [];
+          for (const p of plugins) {
+            const inSettings = includeSlugs.has(p.slug) || settings.indexOf(p.name) >= 0;
+            const inBuild = depSlugs.has(p.slug) || buildGradle.indexOf(p.name) >= 0;
+            const inJson = jsonPkgs.has(p.name) || pluginsJsonRaw.indexOf(p.name) >= 0;
+            // Gradle wiring alone is not enough: a package exposing an
+            // @CapacitorPlugin class must also be listed in
+            // capacitor.plugins.json, which is what the runtime bridge reads.
+            const registered = inSettings && inBuild && (!p.needsJson || inJson);
+            rows.push([p.name, p.declared ? 'declared' : 'transitive', inSettings ? 'gradle-settings:yes' : 'gradle-settings:NO', inBuild ? 'gradle-deps:yes' : 'gradle-deps:NO', p.needsJson ? (inJson ? 'plugins.json:yes' : 'plugins.json:NO (required)') : 'plugins.json:n/a'].join(' | '));
+            if (!registered) missing.push(p.name);
+          }
+
+          const out = [];
+          out.push('[plugins] Resolved native Android plugins: ' + (plugins.length ? plugins.map((p) => p.name).join(', ') : 'none'));
+          rows.forEach((r) => out.push('[plugins]   ' + r));
+          out.push('[plugins] capacitor.plugins.json: ' + (pluginsJsonRaw ? pluginsJson.length + ' class entries' : 'absent'));
+          console.log(out.join('\\n'));
+
+          fs.writeFileSync('/tmp/apkforge-plugin-audit.json', JSON.stringify({
+            plugins: plugins.map((p) => p.name),
+            runtimePlugins: plugins.filter((p) => p.needsJson).map((p) => p.name),
+            missing: missing,
+            pluginsJsonExists: !!pluginsJsonRaw,
+            rows: rows,
+          }));
+          process.exit(missing.length ? 1 : 0);
+          NODEEOF
+
+          audit() { node /tmp/apkforge-plugin-audit.cjs | tee -a "$REPORT"; }
+          audit_missing() { node -e "try{console.log(JSON.parse(require('fs').readFileSync('/tmp/apkforge-plugin-audit.json','utf8')).missing.join(' '))}catch(e){console.log('')}"; }
+
+          # Repair ladder — each rung is attempted before the build is allowed to fail.
+          if ! audit; then
+            MISSING="$(audit_missing)"
+            log "REPAIR: plugins not registered after first sync: $MISSING — reinstalling at the Capacitor core major"
+            for P in $MISSING; do
+              if [ -n "$CORE_MAJ" ]; then \${ADD_CMD:-npm install} "$P@^$CORE_MAJ" >/dev/null 2>&1 || \${ADD_CMD:-npm install} "$P" >/dev/null 2>&1 || true
+              else \${ADD_CMD:-npm install} "$P" >/dev/null 2>&1 || true; fi
+            done
+            $CAP sync android > /tmp/cap-sync-repair-1.log 2>&1 || true
+            tail -n 30 /tmp/cap-sync-repair-1.log || true
+          fi
+
+          if ! audit; then
+            log "REPAIR: running cap update android"
+            $CAP update android > /tmp/cap-update.log 2>&1 || true
+            tail -n 30 /tmp/cap-update.log || true
+            $CAP sync android > /tmp/cap-sync-repair-2.log 2>&1 || true
+          fi
+
+          if ! audit; then
+            log "REPAIR: regenerating the native Android project from scratch (last resort)"
+            rm -rf android
+            $CAP add android > /tmp/cap-add-repair.log 2>&1 || true
+            tail -n 40 /tmp/cap-add-repair.log || true
+            $CAP sync android > /tmp/cap-sync-repair-3.log 2>&1 || true
+          fi
+
+          if ! audit; then
+            MISSING="$(audit_missing)"
+            log "[plugins] Per-plugin evidence:"
+            node -e "try{JSON.parse(require('fs').readFileSync('/tmp/apkforge-plugin-audit.json','utf8')).rows.forEach(function(r){console.log('  '+r)})}catch(e){}" | tee -a "$REPORT"
+            fail "SYNC_VALIDATION_FAILED: these Capacitor plugins were not registered in the native Android project after install, cap sync, cap update and a full native regeneration: $MISSING"
+          fi
+
+          PLUGIN_LIST="$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('/tmp/apkforge-plugin-audit.json','utf8')).plugins.join(','))}catch(e){console.log('')}")"
+          PLUGINS_JSON_EXISTS="$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('/tmp/apkforge-plugin-audit.json','utf8')).pluginsJsonExists?'1':'')}catch(e){console.log('')}")"
+          if [ -n "$PLUGIN_LIST" ] && [ -z "$PLUGINS_JSON_EXISTS" ]; then
+            log "REPAIR: capacitor.plugins.json is still absent with $PLUGIN_LIST registered — re-running cap sync"
+            $CAP sync android || true
+            [ -f "$PLUGINS_JSON" ] || fail "SYNC_VALIDATION_FAILED: capacitor.plugins.json was not generated even though native plugins are registered ($PLUGIN_LIST). Gradle must not run without it."
+          fi
+          if [ -z "$PLUGIN_LIST" ]; then
+            log "[sync] Project declares no native Capacitor plugins"
+          fi
+          log "[sync] Registered Capacitor plugins: \${PLUGIN_LIST:-none}"
+          echo "APKFORGE_PLUGINS=$PLUGIN_LIST" >> "$GITHUB_ENV"
+          RUNTIME_LIST="$(node -e "try{console.log((JSON.parse(require('fs').readFileSync('/tmp/apkforge-plugin-audit.json','utf8')).runtimePlugins||[]).join(','))}catch(e){console.log('')}")"
+          log "[sync] Plugins that must appear in capacitor.plugins.json: \${RUNTIME_LIST:-none}"
+          echo "APKFORGE_RUNTIME_PLUGINS=$RUNTIME_LIST" >> "$GITHUB_ENV"
+
+      - name: Browser plugin forensic trace (post-sync)
+        if: success() || failure()
+        working-directory: project
+        run: |
+          set +e
+          cat > /tmp/apkforge-browser-trace.sh <<'TRACEEOF'
+          #!/usr/bin/env bash
+          # Evidence-only forensic trace of @capacitor/browser through the pipeline.
+          # This script never repairs anything: it only records what exists where.
+          PHASE="$1"
+          TRACE="browser-plugin-trace.txt"
+          out() { echo "$1" | tee -a "$TRACE"; }
+          VERDICT=""
+          note() { [ -n "$VERDICT" ] || VERDICT="$1"; }
+
+          out "========== Browser plugin trace ($PHASE) =========="
+          out "cwd: $(pwd)"
+
+          if [ "$PHASE" != "post-apk" ]; then
+            # 1. Declaration in package.json
+            DECL="$(node -e "var p=require('./package.json');var d=Object.assign({},p.dependencies||{},p.devDependencies||{});console.log(d['@capacitor/browser']||'')" 2>/dev/null)"
+            if [ -n "$DECL" ]; then
+              out "1 PASS  package.json declares @capacitor/browser@$DECL"
+            else
+              out "1 FAIL  project/package.json does not declare @capacitor/browser"
+              node -e "var p=require('./package.json');var d=Object.assign({},p.dependencies||{},p.devDependencies||{});console.log('      capacitor-ish deps present: '+(Object.keys(d).filter(function(k){return /capacitor/.test(k);}).join(', ')||'none'))" 2>/dev/null | tee -a "$TRACE"
+              note "stage 1 — @capacitor/browser is not declared in project/package.json, so nothing downstream can install or register it"
+            fi
+
+            # 2. Installed in node_modules
+            if [ -f node_modules/@capacitor/browser/package.json ]; then
+              out "2 PASS  node_modules/@capacitor/browser present, version $(node -p "require('./node_modules/@capacitor/browser/package.json').version" 2>/dev/null)"
+            else
+              out "2 FAIL  node_modules/@capacitor/browser/package.json does not exist"
+              note "stage 2 — @capacitor/browser is not installed in node_modules"
+            fi
+
+            # 3. Native Android sources shipped by the plugin
+            if [ -d node_modules/@capacitor/browser/android ]; then
+              out "3 PASS  node_modules/@capacitor/browser/android exists"
+              find node_modules/@capacitor/browser/android -name 'BrowserPlugin.java' 2>/dev/null | sed 's/^/      /' | tee -a "$TRACE"
+            else
+              out "3 FAIL  node_modules/@capacitor/browser/android is missing (no native code for cap sync to register)"
+              note "stage 3 — the installed @capacitor/browser package ships no android/ native sources"
+            fi
+
+            # 4. cap sync evidence
+            if [ -f /tmp/cap-sync.log ] || [ -f /tmp/cap-sync-retry.log ]; then
+              out "4 INFO  cap sync exit marker: \${CAP_SYNC_EXIT:-unknown}"
+              out "4 ----- cap sync output (verbatim) -----"
+              cat /tmp/cap-sync.log /tmp/cap-sync-retry.log 2>/dev/null | sed 's/^/      /' | tee -a "$TRACE"
+              if cat /tmp/cap-sync.log /tmp/cap-sync-retry.log 2>/dev/null | grep -qi "@capacitor/browser"; then
+                out "4 PASS  cap sync output mentions @capacitor/browser"
+              else
+                out "4 FAIL  cap sync output never mentions @capacitor/browser"
+                note "stage 4 — cap sync did not see @capacitor/browser as an installed plugin"
+              fi
+            else
+              out "4 SKIP  no cap sync log captured"
+            fi
+
+            # 5/6. capacitor.plugins.json
+            PJ="android/app/src/main/assets/capacitor.plugins.json"
+            if [ -f "$PJ" ]; then
+              out "5 PASS  $PJ exists:"
+              sed 's/^/      /' "$PJ" | tee -a "$TRACE"
+              if grep -q "BrowserPlugin" "$PJ"; then
+                out "6 PASS  $PJ registers com.capacitorjs.plugins.browser.BrowserPlugin"
+              else
+                out "6 FAIL  $PJ contains no BrowserPlugin entry"
+                note "stage 6 — capacitor.plugins.json exists but has no Browser entry"
+              fi
+            else
+              out "5 FAIL  $PJ does not exist after cap sync"
+              note "stage 5 — capacitor.plugins.json was not generated by cap sync"
+            fi
+
+            # 7. Gradle registration
+            out "7 ----- Gradle plugin registration -----"
+            for f in android/capacitor.settings.gradle android/app/capacitor.build.gradle; do
+              if [ -f "$f" ]; then
+                HIT="$(grep -n -i "capacitor-browser" "$f")"
+                if [ -n "$HIT" ]; then
+                  out "7 PASS  $f:"; echo "$HIT" | sed 's/^/      /' | tee -a "$TRACE"
+                else
+                  out "7 FAIL  $f has no capacitor-browser entry"
+                  note "stage 7 — $f does not include the capacitor-browser Gradle module"
+                fi
+              else
+                out "7 FAIL  $f is missing"
+                note "stage 7 — $f is missing from the native project"
+              fi
+            done
+
+            # 8. MainActivity
+            MA="$(find android/app/src/main/java -name MainActivity.java 2>/dev/null | head -n 1)"
+            if [ -n "$MA" ]; then
+              out "8 ----- $MA (full contents) -----"
+              sed 's/^/      /' "$MA" | tee -a "$TRACE"
+              if grep -q "extends BridgeActivity" "$MA"; then
+                out "8 PASS  MainActivity extends BridgeActivity (auto-registration path intact)"
+              else
+                out "8 FAIL  MainActivity does not extend BridgeActivity"
+                note "stage 8 — MainActivity at $MA does not extend BridgeActivity, so plugins are never auto-registered"
+              fi
+              if grep -q "registerPlugin" "$MA"; then
+                out "8 WARN  MainActivity calls registerPlugin explicitly — an explicit list replaces auto-registration:"
+                grep -n "registerPlugin" "$MA" | sed 's/^/      /' | tee -a "$TRACE"
+                grep -q "BrowserPlugin" "$MA" || note "stage 8 — MainActivity registers an explicit plugin list that omits BrowserPlugin"
+              else
+                out "8 PASS  MainActivity uses Capacitor auto-registration (no explicit registerPlugin list)"
+              fi
+              if grep -q "ApkforgeOAuthDiagnostics" "$MA"; then
+                out "8 INFO  APKForge diagnostics injection is present in MainActivity (class declaration unchanged: $(grep -c 'extends BridgeActivity' "$MA") BridgeActivity declaration(s))"
+              else
+                out "8 INFO  No APKForge diagnostics injection in MainActivity"
+              fi
+            else
+              out "8 FAIL  MainActivity.java not found under android/app/src/main/java"
+              note "stage 8 — MainActivity.java is missing from the native project"
+            fi
+          fi
+
+          if [ "$PHASE" = "post-apk" ]; then
+            APK="$(find android/app/build/outputs/apk/release -name '*.apk' 2>/dev/null | head -n 1)"
+            if [ -z "$APK" ]; then
+              out "9 FAIL  no release APK found under android/app/build/outputs/apk/release"
+              note "stage 9 — no release APK was produced"
+            else
+              out "9 ----- APK assets ($APK) -----"
+              unzip -l "$APK" | grep -E "assets/(capacitor|public/index)" | sed 's/^/      /' | tee -a "$TRACE"
+              if unzip -p "$APK" assets/capacitor.plugins.json > /tmp/apk-browser-plugins.json 2>/dev/null; then
+                out "9 PASS  assets/capacitor.plugins.json is packaged:"
+                sed 's/^/      /' /tmp/apk-browser-plugins.json | tee -a "$TRACE"
+                if grep -q "BrowserPlugin" /tmp/apk-browser-plugins.json; then
+                  out "9 PASS  packaged capacitor.plugins.json contains BrowserPlugin"
+                else
+                  out "9 FAIL  packaged capacitor.plugins.json has no BrowserPlugin entry"
+                  note "stage 9 — the packaged APK's capacitor.plugins.json omits Browser"
+                fi
+              else
+                out "9 FAIL  assets/capacitor.plugins.json is not inside the APK"
+                note "stage 9 — capacitor.plugins.json was not packaged into the APK"
+              fi
+
+              # 10. Native classes inside the dex
+              FOUND_CLASS=""
+              for DEX in $(unzip -Z1 "$APK" 'classes*.dex' 2>/dev/null); do
+                unzip -p "$APK" "$DEX" > /tmp/apkforge.dex 2>/dev/null || continue
+                if strings /tmp/apkforge.dex 2>/dev/null | grep -q "capacitorjs/plugins/browser/BrowserPlugin"; then
+                  FOUND_CLASS="$DEX"; break
+                fi
+              done
+              if [ -n "$FOUND_CLASS" ]; then
+                out "10 PASS  BrowserPlugin native class found in $FOUND_CLASS"
+              else
+                out "10 FAIL  BrowserPlugin native class is not present in any classes*.dex of the APK"
+                note "stage 10 — the Browser native class was never compiled into the APK"
+              fi
+
+              # 11. Artifact identity
+              out "11 ----- artifact identity -----"
+              out "      path:      $APK"
+              out "      sha256:    $(sha256sum "$APK" | cut -d' ' -f1)"
+              out "      size:      $(wc -c < "$APK") bytes"
+              out "      built at:  $(date -u -r "$APK" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
+              out "      build_id:  \${BUILD_ID:-unknown}"
+              out "      run:       \${GITHUB_REPOSITORY:-?}/actions/runs/\${GITHUB_RUN_ID:-?}"
+              out "      Compare this sha256 with the installed APK to confirm the device runs this artifact."
+            fi
+          fi
+
+          if [ -n "$VERDICT" ]; then
+            out "BROWSER_TRACE_VERDICT: $VERDICT"
+          else
+            out "BROWSER_TRACE_VERDICT: present end-to-end ($PHASE)"
+          fi
+          out "========== end Browser plugin trace ($PHASE) =========="
+          TRACEEOF
+          chmod +x /tmp/apkforge-browser-trace.sh
+          bash /tmp/apkforge-browser-trace.sh post-sync
+
+          # Auto-repair ladder: install at the core major, re-sync, then
+          # cap update, then a full native regeneration before giving up.
+          # Gated on the project actually requiring Browser — a project with
+          # no OAuth/browser signal must never have @capacitor/browser force-
+          # installed just because it wasn't declared (that would inject a
+          # plugin the app never asked for into every generated APK).
+          BROWSER_REQUIRED=""
+          case ",\${APKFORGE_RUNTIME_PLUGINS:-}," in *",@capacitor/browser,"*) BROWSER_REQUIRED=1 ;; esac
+          node -e "const d=require('./package.json');const a={...(d.dependencies||{}),...(d.devDependencies||{})};process.exit(a['@capacitor/browser']?0:1)" 2>/dev/null && BROWSER_REQUIRED=1
+          if [ -z "$BROWSER_REQUIRED" ]; then
+            echo "[browser-repair] @capacitor/browser is not required by this project (no OAuth signal, not declared) — skipping repair" | tee -a "$REPORT"
+          elif grep -q "^BROWSER_TRACE_VERDICT: stage" browser-plugin-trace.txt 2>/dev/null; then
+            echo "[browser-repair] Browser plugin trace reported a gap — repairing"
+            CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null)"
+            if [ -n "$CORE_MAJ" ]; then
+              \${ADD_CMD:-npm install} "@capacitor/browser@^$CORE_MAJ" || \${ADD_CMD:-npm install} @capacitor/browser || true
+            else
+              \${ADD_CMD:-npm install} @capacitor/browser || true
+            fi
+            npx cap sync android > /tmp/cap-sync-browser-repair.log 2>&1 || true
+            tail -n 40 /tmp/cap-sync-browser-repair.log || true
+            mv browser-plugin-trace.txt browser-plugin-trace-before-repair.txt 2>/dev/null || true
+            bash /tmp/apkforge-browser-trace.sh post-sync-repair
+            if ! grep -q "^BROWSER_TRACE_VERDICT: present end-to-end" browser-plugin-trace.txt 2>/dev/null; then
+              echo "[browser-repair] Still missing — running cap update android"
+              npx cap update android > /tmp/cap-update-browser-repair.log 2>&1 || true
+              npx cap sync android > /tmp/cap-sync-browser-repair-2.log 2>&1 || true
+              bash /tmp/apkforge-browser-trace.sh post-update-repair
+            fi
+            if ! grep -q "^BROWSER_TRACE_VERDICT: present end-to-end" browser-plugin-trace.txt 2>/dev/null; then
+              echo "[browser-repair] Still missing — regenerating the native Android project"
+              rm -rf android
+              npx cap add android > /tmp/cap-add-browser-repair.log 2>&1 || true
+              npx cap sync android > /tmp/cap-sync-browser-repair-3.log 2>&1 || true
+              bash /tmp/apkforge-browser-trace.sh post-regenerate-repair
+            fi
+
+            if grep -q "^BROWSER_TRACE_VERDICT: present end-to-end" browser-plugin-trace.txt 2>/dev/null; then
+              echo "BROWSER_TRACE_VERDICT: repaired (Browser plugin installed and registered during the build)" | tee -a "$REPORT"
+            else
+              echo "BROWSER_TRACE_VERDICT: unrepairable — see browser-plugin-trace.txt" | tee -a "$REPORT"
+            fi
+          fi
+          exit 0
+
+      - name: Preferences plugin forensic trace + repair (post-sync)
+        if: success() || failure()
+        working-directory: project
+        run: |
+          set +e
+          cat > /tmp/apkforge-preferences-trace.sh <<'TRACEEOF'
+          #!/usr/bin/env bash
+          # Evidence-only forensic trace of @capacitor/preferences through the
+          # pipeline, mirroring the Browser trace above. Never repairs anything
+          # itself — only records what exists where.
+          PHASE="$1"
+          TRACE="preferences-plugin-trace.txt"
+          out() { echo "$1" | tee -a "$TRACE"; }
+          VERDICT=""
+          note() { [ -n "$VERDICT" ] || VERDICT="$1"; }
+
+          out "========== Preferences plugin trace ($PHASE) =========="
+          out "cwd: $(pwd)"
+
+          if [ "$PHASE" != "post-apk" ]; then
+            # 1. Declaration in package.json
+            DECL="$(node -e "var p=require('./package.json');var d=Object.assign({},p.dependencies||{},p.devDependencies||{});console.log(d['@capacitor/preferences']||'')" 2>/dev/null)"
+            if [ -n "$DECL" ]; then
+              out "1 PASS  package.json declares @capacitor/preferences@$DECL"
+            else
+              out "1 FAIL  project/package.json does not declare @capacitor/preferences"
+              note "stage 1 — @capacitor/preferences is not declared in project/package.json, so nothing downstream can install or register it"
+            fi
+
+            # 2. Installed in node_modules
+            if [ -f node_modules/@capacitor/preferences/package.json ]; then
+              out "2 PASS  node_modules/@capacitor/preferences present, version $(node -p "require('./node_modules/@capacitor/preferences/package.json').version" 2>/dev/null)"
+            else
+              out "2 FAIL  node_modules/@capacitor/preferences/package.json does not exist"
+              note "stage 2 — @capacitor/preferences is not installed in node_modules"
+            fi
+
+            # 3. Native Android sources shipped by the plugin
+            if [ -d node_modules/@capacitor/preferences/android ]; then
+              out "3 PASS  node_modules/@capacitor/preferences/android exists"
+              find node_modules/@capacitor/preferences/android -name 'PreferencesPlugin.java' 2>/dev/null | sed 's/^/      /' | tee -a "$TRACE"
+            else
+              out "3 FAIL  node_modules/@capacitor/preferences/android is missing (no native code for cap sync to register)"
+              note "stage 3 — the installed @capacitor/preferences package ships no android/ native sources"
+            fi
+
+            # 4. cap sync evidence
+            if [ -f /tmp/cap-sync.log ] || [ -f /tmp/cap-sync-retry.log ]; then
+              out "4 INFO  cap sync exit marker: \${CAP_SYNC_EXIT:-unknown}"
+              if cat /tmp/cap-sync.log /tmp/cap-sync-retry.log 2>/dev/null | grep -qi "@capacitor/preferences"; then
+                out "4 PASS  cap sync output mentions @capacitor/preferences"
+              else
+                out "4 FAIL  cap sync output never mentions @capacitor/preferences"
+                note "stage 4 — cap sync did not see @capacitor/preferences as an installed plugin"
+              fi
+            else
+              out "4 SKIP  no cap sync log captured"
+            fi
+
+            # 5/6. capacitor.plugins.json
+            PJ="android/app/src/main/assets/capacitor.plugins.json"
+            if [ -f "$PJ" ]; then
+              out "5 PASS  $PJ exists"
+              if grep -q "PreferencesPlugin" "$PJ"; then
+                out "6 PASS  $PJ registers com.capacitorjs.plugins.preferences.PreferencesPlugin"
+              else
+                out "6 FAIL  $PJ contains no PreferencesPlugin entry"
+                note "stage 6 — capacitor.plugins.json exists but has no Preferences entry"
+              fi
+            else
+              out "5 FAIL  $PJ does not exist after cap sync"
+              note "stage 5 — capacitor.plugins.json was not generated by cap sync"
+            fi
+
+            # 7. Gradle registration
+            out "7 ----- Gradle plugin registration -----"
+            for f in android/capacitor.settings.gradle android/app/capacitor.build.gradle; do
+              if [ -f "$f" ]; then
+                HIT="$(grep -n -i "capacitor-preferences" "$f")"
+                if [ -n "$HIT" ]; then
+                  out "7 PASS  $f:"; echo "$HIT" | sed 's/^/      /' | tee -a "$TRACE"
+                else
+                  out "7 FAIL  $f has no capacitor-preferences entry"
+                  note "stage 7 — $f does not include the capacitor-preferences Gradle module"
+                fi
+              else
+                out "7 FAIL  $f is missing"
+                note "stage 7 — $f is missing from the native project"
+              fi
+            done
+
+            # 8. MainActivity — same auto-registration path as Browser
+            MA="$(find android/app/src/main/java -name MainActivity.java 2>/dev/null | head -n 1)"
+            if [ -n "$MA" ]; then
+              if grep -q "extends BridgeActivity" "$MA"; then
+                out "8 PASS  MainActivity extends BridgeActivity (auto-registration path intact)"
+              else
+                out "8 FAIL  MainActivity does not extend BridgeActivity"
+                note "stage 8 — MainActivity at $MA does not extend BridgeActivity, so plugins are never auto-registered"
+              fi
+              if grep -q "registerPlugin" "$MA"; then
+                grep -q "PreferencesPlugin" "$MA" || note "stage 8 — MainActivity registers an explicit plugin list that omits PreferencesPlugin"
+              fi
+            else
+              out "8 FAIL  MainActivity.java not found under android/app/src/main/java"
+              note "stage 8 — MainActivity.java is missing from the native project"
+            fi
+          fi
+
+          if [ "$PHASE" = "post-apk" ]; then
+            APK="$(find android/app/build/outputs/apk/release -name '*.apk' 2>/dev/null | head -n 1)"
+            if [ -z "$APK" ]; then
+              out "9 FAIL  no release APK found under android/app/build/outputs/apk/release"
+              note "stage 9 — no release APK was produced"
+            else
+              if unzip -p "$APK" assets/capacitor.plugins.json > /tmp/apk-preferences-plugins.json 2>/dev/null; then
+                out "9 PASS  assets/capacitor.plugins.json is packaged"
+                if grep -q "PreferencesPlugin" /tmp/apk-preferences-plugins.json; then
+                  out "9 PASS  packaged capacitor.plugins.json contains PreferencesPlugin"
+                else
+                  out "9 FAIL  packaged capacitor.plugins.json has no PreferencesPlugin entry"
+                  note "stage 9 — the packaged APK's capacitor.plugins.json omits Preferences"
+                fi
+              else
+                out "9 FAIL  assets/capacitor.plugins.json is not inside the APK"
+                note "stage 9 — capacitor.plugins.json was not packaged into the APK"
+              fi
+
+              # 10. Native class inside the dex — the APK is the source of truth
+              FOUND_CLASS=""
+              for DEX in $(unzip -Z1 "$APK" 'classes*.dex' 2>/dev/null); do
+                unzip -p "$APK" "$DEX" > /tmp/apkforge-prefs.dex 2>/dev/null || continue
+                if strings /tmp/apkforge-prefs.dex 2>/dev/null | grep -q "capacitorjs/plugins/preferences/PreferencesPlugin"; then
+                  FOUND_CLASS="$DEX"; break
+                fi
+              done
+              if [ -n "$FOUND_CLASS" ]; then
+                out "10 PASS  PreferencesPlugin native class found in $FOUND_CLASS"
+              else
+                out "10 FAIL  PreferencesPlugin native class is not present in any classes*.dex of the APK"
+                note "stage 10 — the Preferences native class was never compiled into the APK"
+              fi
+            fi
+          fi
+
+          if [ -n "$VERDICT" ]; then
+            out "PREFERENCES_TRACE_VERDICT: $VERDICT"
+          else
+            out "PREFERENCES_TRACE_VERDICT: present end-to-end ($PHASE)"
+          fi
+          out "========== end Preferences plugin trace ($PHASE) =========="
+          TRACEEOF
+          chmod +x /tmp/apkforge-preferences-trace.sh
+          bash /tmp/apkforge-preferences-trace.sh post-sync
+
+          # Gated exactly like Browser: only repair when the project actually
+          # requires Preferences (localStorage/sessionStorage/persist signal,
+          # a registerPlugin('Preferences') call, or an explicit dependency).
+          PREFERENCES_REQUIRED=""
+          case ",\${APKFORGE_RUNTIME_PLUGINS:-}," in *",@capacitor/preferences,"*) PREFERENCES_REQUIRED=1 ;; esac
+          node -e "const d=require('./package.json');const a={...(d.dependencies||{}),...(d.devDependencies||{})};process.exit(a['@capacitor/preferences']?0:1)" 2>/dev/null && PREFERENCES_REQUIRED=1
+          if [ -z "$PREFERENCES_REQUIRED" ]; then
+            echo "[preferences-repair] @capacitor/preferences is not required by this project — skipping repair" | tee -a "$REPORT"
+          elif grep -q "^PREFERENCES_TRACE_VERDICT: stage" preferences-plugin-trace.txt 2>/dev/null; then
+            echo "[preferences-repair] Preferences plugin trace reported a gap — repairing"
+            CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null)"
+            if [ -n "$CORE_MAJ" ]; then
+              \${ADD_CMD:-npm install} "@capacitor/preferences@^$CORE_MAJ" || \${ADD_CMD:-npm install} @capacitor/preferences || true
+            else
+              \${ADD_CMD:-npm install} @capacitor/preferences || true
+            fi
+            npx cap sync android > /tmp/cap-sync-preferences-repair.log 2>&1 || true
+            tail -n 40 /tmp/cap-sync-preferences-repair.log || true
+            mv preferences-plugin-trace.txt preferences-plugin-trace-before-repair.txt 2>/dev/null || true
+            bash /tmp/apkforge-preferences-trace.sh post-sync-repair
+            if ! grep -q "^PREFERENCES_TRACE_VERDICT: present end-to-end" preferences-plugin-trace.txt 2>/dev/null; then
+              echo "[preferences-repair] Still missing — running cap update android"
+              npx cap update android > /tmp/cap-update-preferences-repair.log 2>&1 || true
+              npx cap sync android > /tmp/cap-sync-preferences-repair-2.log 2>&1 || true
+              bash /tmp/apkforge-preferences-trace.sh post-update-repair
+            fi
+            if ! grep -q "^PREFERENCES_TRACE_VERDICT: present end-to-end" preferences-plugin-trace.txt 2>/dev/null; then
+              echo "[preferences-repair] Still missing — regenerating the native Android project"
+              rm -rf android
+              npx cap add android > /tmp/cap-add-preferences-repair.log 2>&1 || true
+              npx cap sync android > /tmp/cap-sync-preferences-repair-3.log 2>&1 || true
+              bash /tmp/apkforge-preferences-trace.sh post-regenerate-repair
+            fi
+
+            if grep -q "^PREFERENCES_TRACE_VERDICT: present end-to-end" preferences-plugin-trace.txt 2>/dev/null; then
+              echo "PREFERENCES_TRACE_VERDICT: repaired (Preferences plugin installed and registered during the build)" | tee -a "$REPORT"
+            else
+              echo "PREFERENCES_TRACE_VERDICT: unrepairable — see preferences-plugin-trace.txt" | tee -a "$REPORT"
+            fi
+          fi
+          exit 0
+
+      - name: App plugin forensic trace + repair (post-sync)
+        if: success() || failure()
+        working-directory: project
+        run: |
+          set +e
+          cat > /tmp/apkforge-app-trace.sh <<'TRACEEOF'
+          #!/usr/bin/env bash
+          # Same evidence chain as Browser/Preferences, for @capacitor/app.
+          # @capacitor/app underpins appUrlOpen/getLaunchUrl (the OAuth
+          # deep-link callback path), so this is checked on every build —
+          # it is the one plugin that is always required.
+          PHASE="$1"
+          TRACE="app-plugin-trace.txt"
+          out() { echo "$1" | tee -a "$TRACE"; }
+          VERDICT=""
+          note() { [ -n "$VERDICT" ] || VERDICT="$1"; }
+
+          out "========== App plugin trace ($PHASE) =========="
+          out "cwd: $(pwd)"
+
+          if [ "$PHASE" != "post-apk" ]; then
+            DECL="$(node -e "var p=require('./package.json');var d=Object.assign({},p.dependencies||{},p.devDependencies||{});console.log(d['@capacitor/app']||'')" 2>/dev/null)"
+            if [ -n "$DECL" ]; then
+              out "1 PASS  package.json declares @capacitor/app@$DECL"
+            else
+              out "1 FAIL  project/package.json does not declare @capacitor/app"
+              note "stage 1 — @capacitor/app is not declared in project/package.json"
+            fi
+
+            if [ -f node_modules/@capacitor/app/package.json ]; then
+              out "2 PASS  node_modules/@capacitor/app present, version $(node -p "require('./node_modules/@capacitor/app/package.json').version" 2>/dev/null)"
+            else
+              out "2 FAIL  node_modules/@capacitor/app/package.json does not exist"
+              note "stage 2 — @capacitor/app is not installed in node_modules"
+            fi
+
+            if [ -d node_modules/@capacitor/app/android ]; then
+              out "3 PASS  node_modules/@capacitor/app/android exists"
+            else
+              out "3 FAIL  node_modules/@capacitor/app/android is missing"
+              note "stage 3 — the installed @capacitor/app package ships no android/ native sources"
+            fi
+
+            PJ="android/app/src/main/assets/capacitor.plugins.json"
+            if [ -f "$PJ" ]; then
+              out "4 PASS  $PJ exists"
+              if grep -q "AppPlugin" "$PJ"; then
+                out "5 PASS  $PJ registers com.capacitorjs.plugins.app.AppPlugin"
+              else
+                out "5 FAIL  $PJ contains no AppPlugin entry"
+                note "stage 5 — capacitor.plugins.json exists but has no App entry"
+              fi
+            else
+              out "4 FAIL  $PJ does not exist after cap sync"
+              note "stage 4 — capacitor.plugins.json was not generated by cap sync"
+            fi
+
+            out "6 ----- Gradle plugin registration -----"
+            for f in android/capacitor.settings.gradle android/app/capacitor.build.gradle; do
+              if [ -f "$f" ]; then
+                HIT="$(grep -n -i "capacitor-app" "$f")"
+                if [ -n "$HIT" ]; then
+                  out "6 PASS  $f:"; echo "$HIT" | sed 's/^/      /' | tee -a "$TRACE"
+                else
+                  out "6 FAIL  $f has no capacitor-app entry"
+                  note "stage 6 — $f does not include the capacitor-app Gradle module"
+                fi
+              else
+                out "6 FAIL  $f is missing"
+                note "stage 6 — $f is missing from the native project"
+              fi
+            done
+
+            # MainActivity + deep-link intent filter — this is the plugin
+            # that actually receives the OAuth callback via appUrlOpen/
+            # getLaunchUrl, so the intent filter is part of its contract.
+            MA="$(find android/app/src/main/java -name MainActivity.java 2>/dev/null | head -n 1)"
+            if [ -n "$MA" ]; then
+              if grep -q "extends BridgeActivity" "$MA"; then
+                out "7 PASS  MainActivity extends BridgeActivity"
+              else
+                out "7 FAIL  MainActivity does not extend BridgeActivity"
+                note "stage 7 — MainActivity at $MA does not extend BridgeActivity"
+              fi
+              if grep -q "registerPlugin" "$MA"; then
+                grep -q "AppPlugin" "$MA" || note "stage 7 — MainActivity registers an explicit plugin list that omits AppPlugin"
+              fi
+            else
+              out "7 FAIL  MainActivity.java not found under android/app/src/main/java"
+              note "stage 7 — MainActivity.java is missing from the native project"
+            fi
+
+            MANIFEST="android/app/src/main/AndroidManifest.xml"
+            if [ -f "$MANIFEST" ]; then
+              if grep -q "android.intent.action.VIEW" "$MANIFEST" && grep -q "android.intent.category.BROWSABLE" "$MANIFEST"; then
+                out "8 PASS  $MANIFEST has a VIEW/BROWSABLE intent filter (deep-link callback route)"
+              else
+                out "8 FAIL  $MANIFEST has no VIEW/BROWSABLE intent filter"
+                note "stage 8 — no deep-link intent filter in AndroidManifest.xml, so appUrlOpen can never fire"
+              fi
+            else
+              out "8 FAIL  $MANIFEST is missing"
+              note "stage 8 — AndroidManifest.xml is missing"
+            fi
+          fi
+
+          if [ "$PHASE" = "post-apk" ]; then
+            APK="$(find android/app/build/outputs/apk/release -name '*.apk' 2>/dev/null | head -n 1)"
+            if [ -z "$APK" ]; then
+              out "9 FAIL  no release APK found under android/app/build/outputs/apk/release"
+              note "stage 9 — no release APK was produced"
+            else
+              if unzip -p "$APK" assets/capacitor.plugins.json > /tmp/apk-app-plugins.json 2>/dev/null && grep -q "AppPlugin" /tmp/apk-app-plugins.json; then
+                out "9 PASS  packaged capacitor.plugins.json contains AppPlugin"
+              else
+                out "9 FAIL  packaged capacitor.plugins.json omits App"
+                note "stage 9 — the packaged APK's capacitor.plugins.json omits App"
+              fi
+
+              FOUND_CLASS=""
+              for DEX in $(unzip -Z1 "$APK" 'classes*.dex' 2>/dev/null); do
+                unzip -p "$APK" "$DEX" > /tmp/apkforge-app.dex 2>/dev/null || continue
+                if strings /tmp/apkforge-app.dex 2>/dev/null | grep -q "capacitorjs/plugins/app/AppPlugin"; then
+                  FOUND_CLASS="$DEX"; break
+                fi
+              done
+              if [ -n "$FOUND_CLASS" ]; then
+                out "10 PASS  AppPlugin native class found in $FOUND_CLASS"
+              else
+                out "10 FAIL  AppPlugin native class is not present in any classes*.dex of the APK"
+                note "stage 10 — the App native class was never compiled into the APK"
+              fi
+
+              if unzip -p "$APK" AndroidManifest.xml > /tmp/apkforge-app-manifest.bin 2>/dev/null && strings /tmp/apkforge-app-manifest.bin 2>/dev/null | grep -qi "BROWSABLE"; then
+                out "11 PASS  final packaged AndroidManifest.xml retains a BROWSABLE intent filter"
+              else
+                out "11 FAIL  final packaged AndroidManifest.xml has no BROWSABLE intent filter"
+                note "stage 11 — the deep-link intent filter did not survive into the final packaged manifest"
+              fi
+            fi
+          fi
+
+          if [ -n "$VERDICT" ]; then
+            out "APP_TRACE_VERDICT: $VERDICT"
+          else
+            out "APP_TRACE_VERDICT: present end-to-end ($PHASE)"
+          fi
+          out "========== end App plugin trace ($PHASE) =========="
+          TRACEEOF
+          chmod +x /tmp/apkforge-app-trace.sh
+          bash /tmp/apkforge-app-trace.sh post-sync
+
+          # App is unconditionally required (Capacitor lifecycle + the OAuth
+          # deep-link callback path depend on it), so no gate is needed here
+          # — unlike Browser/Preferences it is always installed at the
+          # dependency stage regardless of what the project uses.
+          if grep -q "^APP_TRACE_VERDICT: stage" app-plugin-trace.txt 2>/dev/null; then
+            echo "[app-repair] App plugin trace reported a gap — repairing"
+            CORE_MAJ="$(node -e "try{console.log(require('@capacitor/core/package.json').version.split('.')[0])}catch(e){console.log('')}" 2>/dev/null)"
+            if [ -n "$CORE_MAJ" ]; then
+              \${ADD_CMD:-npm install} "@capacitor/app@^$CORE_MAJ" || \${ADD_CMD:-npm install} @capacitor/app || true
+            else
+              \${ADD_CMD:-npm install} @capacitor/app || true
+            fi
+            npx cap sync android > /tmp/cap-sync-app-repair.log 2>&1 || true
+            tail -n 40 /tmp/cap-sync-app-repair.log || true
+            mv app-plugin-trace.txt app-plugin-trace-before-repair.txt 2>/dev/null || true
+            bash /tmp/apkforge-app-trace.sh post-sync-repair
+            if ! grep -q "^APP_TRACE_VERDICT: present end-to-end" app-plugin-trace.txt 2>/dev/null; then
+              echo "[app-repair] Still missing — running cap update android"
+              npx cap update android > /tmp/cap-update-app-repair.log 2>&1 || true
+              npx cap sync android > /tmp/cap-sync-app-repair-2.log 2>&1 || true
+              bash /tmp/apkforge-app-trace.sh post-update-repair
+            fi
+            if ! grep -q "^APP_TRACE_VERDICT: present end-to-end" app-plugin-trace.txt 2>/dev/null; then
+              echo "[app-repair] Still missing — regenerating the native Android project"
+              rm -rf android
+              npx cap add android > /tmp/cap-add-app-repair.log 2>&1 || true
+              npx cap sync android > /tmp/cap-sync-app-repair-3.log 2>&1 || true
+              bash /tmp/apkforge-app-trace.sh post-regenerate-repair
+            fi
+
+            if grep -q "^APP_TRACE_VERDICT: present end-to-end" app-plugin-trace.txt 2>/dev/null; then
+              echo "APP_TRACE_VERDICT: repaired (App plugin installed and registered during the build)" | tee -a "$REPORT"
+            else
+              echo "APP_TRACE_VERDICT: unrepairable — see app-plugin-trace.txt" | tee -a "$REPORT"
+            fi
+          fi
+          exit 0
+
+
+
+      - name: Validate and repair native configuration
+        working-directory: project
+        run: |
+          set -e
+          cat > /tmp/apkforge-native-check.cjs <<'NODEEOF'
+          const fs = require('fs');
+          const path = require('path');
+          const report = process.env.REPORT;
+          const bundleId = process.env.BUNDLE_ID;
+          const problems = [];
+          const fixes = [];
+          const notes = [];
+          const log = (m) => { console.log(m); fs.appendFileSync(report, m + '\\n'); };
+
+          const readSafe = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } };
+          const pkg = JSON.parse(readSafe('package.json') || '{}');
+          const deps = Object.keys({ ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) });
+
+          // ---- Gradle applicationId / namespace ----
+          const appGradlePath = 'android/app/build.gradle';
+          let appGradle = readSafe(appGradlePath);
+          if (!appGradle) problems.push('android/app/build.gradle is missing — the native project is incomplete.');
+          else {
+            let changed = false;
+            const before = appGradle;
+            appGradle = appGradle.replace(/applicationId\\s+["'][^"']+["']/, 'applicationId "' + bundleId + '"');
+            appGradle = appGradle.replace(/namespace\\s+["'][^"']+["']/, 'namespace "' + bundleId + '"');
+            if (appGradle !== before) changed = true;
+            if (/google-services\\.json/.test('') === false && deps.some((d) => /firebase|@capacitor-firebase|@react-native-firebase/.test(d))) {
+              const gs = ['android/app/google-services.json', 'google-services.json', 'android/google-services.json']
+                .find((p) => fs.existsSync(p));
+              if (!gs) {
+                problems.push('Firebase dependencies detected but google-services.json is missing. Add it to android/app/ (or the project root) in the uploaded zip.');
+              } else {
+                if (gs !== 'android/app/google-services.json') {
+                  fs.copyFileSync(gs, 'android/app/google-services.json');
+                  fixes.push('Copied ' + gs + ' to android/app/google-services.json');
+                }
+                if (!/com\\.google\\.gms\\.google-services/.test(appGradle)) {
+                  appGradle += '\\napply plugin: "com.google.gms.google-services"\\n';
+                  changed = true;
+                  fixes.push('Applied the google-services Gradle plugin');
+                }
+                const rootGradle = readSafe('android/build.gradle');
+                if (rootGradle && !/com\\.google\\.gms:google-services/.test(rootGradle)) {
+                  const patched = rootGradle.replace(/(dependencies\\s*\\{)/, '$1\\n        classpath "com.google.gms:google-services:4.4.2"');
+                  if (patched !== rootGradle) {
+                    fs.writeFileSync('android/build.gradle', patched);
+                    fixes.push('Added the google-services classpath to android/build.gradle');
+                  }
+                }
+              }
+            }
+            // minSdk floor required by common plugins
+            const needs24 = deps.some((d) => /push-notifications|local-notifications|barcode|biometric|camera|filesystem|background/.test(d));
+            const minMatch = appGradle.match(/minSdkVersion\\s+([A-Za-z0-9_.]+)/);
+            if (needs24 && minMatch && /^\\d+$/.test(minMatch[1]) && Number(minMatch[1]) < 23) {
+              appGradle = appGradle.replace(/minSdkVersion\\s+\\d+/, 'minSdkVersion 23');
+              changed = true;
+              fixes.push('Raised minSdkVersion to 23 for the installed plugins');
+            }
+            if (changed) fs.writeFileSync(appGradlePath, appGradle);
+            log('[gradle] applicationId/namespace set to ' + bundleId);
+          }
+
+          // ---- Deep link schemes ----
+          const configRaw =
+            readSafe('capacitor.config.ts') || readSafe('capacitor.config.js') || readSafe('capacitor.config.json') || '';
+          const schemes = new Set();
+          const hosts = new Set();
+          if (bundleId) {
+            schemes.add(bundleId.toLowerCase());
+            const last = bundleId.split('.').pop();
+            if (last) schemes.add(last.toLowerCase());
+          }
+          const schemeKeys = [/customUrlScheme["']?\\s*[:=]\\s*["']([^"']+)["']/g, /urlScheme["']?\\s*[:=]\\s*["']([^"']+)["']/g, /androidScheme["']?\\s*[:=]\\s*["']([^"']+)["']/g];
+          for (const re of schemeKeys) {
+            let m;
+            while ((m = re.exec(configRaw))) {
+              const v = m[1].toLowerCase();
+              if (v !== 'https' && v !== 'http') schemes.add(v);
+            }
+          }
+          const hostMatch = /hostname["']?\\s*[:=]\\s*["']([^"']+)["']/.exec(configRaw);
+          if (hostMatch && !/^localhost$/i.test(hostMatch[1])) hosts.add(hostMatch[1]);
+
+          // Scan app sources for redirect URLs like "myapp://auth/callback".
+          const scanDirs = ['src', 'app', 'lib', 'pages'];
+          const scanFile = (p) => {
+            const t = readSafe(p);
+            if (!t) return;
+            const re = /([a-z][a-z0-9+.-]{2,}):\\/\\/([a-z0-9._~-]*)/gi;
+            let m;
+            while ((m = re.exec(t))) {
+              const s = m[1].toLowerCase();
+              if (['http', 'https', 'file', 'data', 'blob', 'ws', 'wss', 'mailto', 'tel', 'capacitor', 'ionic'].includes(s)) continue;
+              schemes.add(s);
+            }
+          };
+          const walk = (dir, depth) => {
+            if (depth > 4) return;
+            let entries = [];
+            try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+            for (const e of entries) {
+              const full = path.join(dir, e.name);
+              if (e.isDirectory()) { if (e.name !== 'node_modules') walk(full, depth + 1); }
+              else if (/\\.(ts|tsx|js|jsx|vue|svelte|json|env|html)$/i.test(e.name)) scanFile(full);
+            }
+          };
+          for (const d of scanDirs) walk(d, 0);
+          for (const f of ['.env', '.env.production', '.env.local']) scanFile(f);
+
+          // ---- AndroidManifest: permissions + intent filters ----
+          const manifestPath = 'android/app/src/main/AndroidManifest.xml';
+          let manifest = readSafe(manifestPath);
+          if (!manifest) problems.push('AndroidManifest.xml is missing from the generated native project.');
+          else {
+            const permsFor = [
+              [/camera|barcode|qr/, ['android.permission.CAMERA']],
+              [/microphone|voice-recorder|record/, ['android.permission.RECORD_AUDIO']],
+              [/filesystem|file-picker|file_picker|share|storage/, ['android.permission.READ_EXTERNAL_STORAGE']],
+              [/push-notifications|local-notifications|firebase-messaging/, ['android.permission.POST_NOTIFICATIONS', 'android.permission.VIBRATE']],
+              [/biometric|native-biometric/, ['android.permission.USE_BIOMETRIC']],
+              [/background|geolocation/, ['android.permission.ACCESS_NETWORK_STATE']],
+            ];
+            const needed = new Set(['android.permission.INTERNET']);
+            for (const [re, perms] of permsFor) {
+              if (deps.some((d) => re.test(d))) perms.forEach((p) => needed.add(p));
+            }
+            const missingPerms = [...needed].filter((p) => !manifest.includes('"' + p + '"'));
+            if (missingPerms.length) {
+              const block = missingPerms.map((p) => '    <uses-permission android:name="' + p + '" />').join('\\n');
+              manifest = manifest.replace(/<\\/manifest>/, block + '\\n</manifest>');
+              fixes.push('Added permissions: ' + missingPerms.join(', '));
+            }
+
+            const missingSchemes = [...schemes].filter((s) => !new RegExp('android:scheme="' + s + '"').test(manifest));
+            if (missingSchemes.length) {
+              const filters = missingSchemes
+                .map(
+                  (s) =>
+                    [
+                      '            <intent-filter android:autoVerify="false">',
+                      '                <action android:name="android.intent.action.VIEW" />',
+                      '                <category android:name="android.intent.category.DEFAULT" />',
+                      '                <category android:name="android.intent.category.BROWSABLE" />',
+                      '                <data android:scheme="' + s + '" />',
+                      '            </intent-filter>',
+                    ].join('\\n'),
+                )
+                .join('\\n');
+              const hostFilters = [...hosts]
+                .filter((h) => !manifest.includes('android:host="' + h + '"'))
+                .map((h) =>
+                  [
+                    '            <intent-filter android:autoVerify="true">',
+                    '                <action android:name="android.intent.action.VIEW" />',
+                    '                <category android:name="android.intent.category.DEFAULT" />',
+                    '                <category android:name="android.intent.category.BROWSABLE" />',
+                    '                <data android:scheme="https" android:host="' + h + '" />',
+                    '            </intent-filter>',
+                  ].join('\\n'),
+                )
+                .join('\\n');
+              const injected = filters + (hostFilters ? '\\n' + hostFilters : '');
+              const activityClose = manifest.match(/<\\/activity>/);
+              if (activityClose) {
+                manifest = manifest.replace(/<\\/activity>/, injected + '\\n        </activity>');
+                fixes.push('Added deep-link intent filters for: ' + missingSchemes.join(', ') + ([...hosts].length ? ' + hosts ' + [...hosts].join(', ') : ''));
+              } else {
+                problems.push('Could not locate the main <activity> in AndroidManifest.xml to add deep-link intent filters.');
+              }
+            }
+            if (!/android:launchMode="singleTask"/.test(manifest)) {
+              manifest = manifest.replace(/(<activity\\b[^>]*?)(>)/, '$1\\n            android:launchMode="singleTask"$2');
+              fixes.push('Set launchMode=singleTask so OAuth callbacks reuse the running activity');
+            }
+            fs.writeFileSync(manifestPath, manifest);
+            log('[deeplinks] Schemes configured: ' + ([...schemes].join(', ') || 'none'));
+            if (hosts.size) log('[deeplinks] App Link hosts: ' + [...hosts].join(', '));
+            fs.writeFileSync('android-expected-schemes.txt', [...schemes].join('\\n'));
+          }
+
+          // ---- Auth provider detection (informational + PKCE sanity) ----
+          const authLibs = deps.filter((d) => /supabase|firebase|auth0|@clerk|amazon-cognito|amplify|msal|next-auth|oidc-client/.test(d));
+          if (authLibs.length) {
+            log('[auth] Detected auth SDKs: ' + authLibs.join(', '));
+            log('[auth] Native OAuth callbacks will resolve through the scheme(s) above (PKCE-compatible).');
+            if (![...schemes].length) problems.push('An auth SDK was detected but no URL scheme could be derived for native OAuth callbacks.');
+          } else {
+            notes.push('[auth] No auth SDK detected — deep links still configured from the bundle id.');
+          }
+
+          for (const n of notes) log(n);
+          for (const f of fixes) log('[auto-fix] ' + f);
+          if (problems.length) {
+            for (const p of problems) log('[blocking] ' + p);
+            log('PREBUILD_VALIDATION_FAILED: ' + problems[0]);
+            process.exit(1);
+          }
+          log('[validate] Native configuration validated');
+          NODEEOF
+          node /tmp/apkforge-native-check.cjs
+          echo "PREBUILD_VALIDATION_PASSED" | tee -a "$REPORT"
+
+      - name: OAuth readiness validation
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          SETTINGS="android/capacitor.settings.gradle"
+          PJ="android/app/src/main/assets/capacitor.plugins.json"
+          FATAL=""
+          check() {
+            # check <label> <condition-result> <fatal|warn>
+            if [ "$2" = "0" ]; then log "OAUTH_READY: $1"; else
+              if [ "$3" = "fatal" ]; then log "OAUTH_FAIL: $1"; FATAL="$FATAL; $1"; else log "OAUTH_WARN: $1"; fi
+            fi
+          }
+          has() { grep -qF "$1" "$2" 2>/dev/null; echo $?; }
+
+          OAUTH_SIGNAL=""
+          grep -rIlqE --exclude-dir=node_modules --exclude-dir=android --exclude-dir=ios "@supabase/supabase-js|firebase/auth|@auth0/|@clerk/|signInWithOAuth|oauth" . 2>/dev/null && OAUTH_SIGNAL=1
+
+          if [ -n "$OAUTH_SIGNAL" ]; then
+            check "@capacitor/browser registered in Gradle" "$(has '@capacitor/browser' "$SETTINGS")" fatal
+            check "@capacitor/app registered in Gradle" "$(has '@capacitor/app' "$SETTINGS")" fatal
+            check "BrowserPlugin present in capacitor.plugins.json" "$(has 'BrowserPlugin' "$PJ")" fatal
+            check "AppPlugin present in capacitor.plugins.json" "$(has 'AppPlugin' "$PJ")" warn
+          else
+            log "OAUTH_READY: no auth SDK detected — OAuth checks are advisory only"
+            check "@capacitor/app registered in Gradle" "$(has '@capacitor/app' "$SETTINGS")" warn
+          fi
+          check "custom-scheme intent filter present" "$(has 'android:scheme=' "$MANIFEST")" warn
+          check "app-link (https) intent filter present" "$(grep -c 'android:scheme="https"' "$MANIFEST" >/dev/null 2>&1 && grep -q 'android:scheme="https"' "$MANIFEST" && echo 0 || echo 1)" warn
+          check "launchMode=singleTask on MainActivity" "$(has 'android:launchMode="singleTask"' "$MANIFEST")" fatal
+          check "appUrlOpen bridge injected" "$(grep -rq 'appUrlOpen' android/app/src/main 2>/dev/null && echo 0 || echo 1)" warn
+
+          if [ -n "$FATAL" ]; then
+            echo "OAUTH_VALIDATION_FAILED:$FATAL" | tee -a "$REPORT"
+            echo "::error::OAuth readiness validation failed:$FATAL"
+            exit 1
+          fi
+          log "[oauth] OAuth readiness validated"
+
+
+      - name: Inject Android lifecycle diagnostics
+        working-directory: project
+        run: |
+          set -e
+          log() { echo "$1" | tee -a "$REPORT"; }
+          cat > /tmp/apkforge-mainactivity-diagnostics.cjs <<'NODEEOF'
+          const fs = require('fs');
+          const path = require('path');
+          const report = process.env.REPORT;
+          const log = (m) => { console.log(m); fs.appendFileSync(report, m + '\\n'); };
+          function walk(dir) {
+            const out = [];
+            let entries = [];
+            try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+            for (const e of entries) {
+              const full = path.join(dir, e.name);
+              if (e.isDirectory()) out.push(...walk(full));
+              else if (e.name === 'MainActivity.java') out.push(full);
+            }
+            return out;
+          }
+          const candidates = walk('android/app/src/main/java');
+          if (!candidates.length) throw new Error('MainActivity.java was not found in the native Android project.');
+          const mainPath = candidates[0];
+          let main = fs.readFileSync(mainPath, 'utf8');
+          const pkg = (main.match(/^\\s*package\\s+([^;]+);/m) || [])[1];
+          if (!pkg) throw new Error('MainActivity.java has no package declaration.');
+          const pkgDir = path.join('android/app/src/main/java', ...pkg.split('.'));
+          const helperPath = path.join(pkgDir, 'ApkforgeOAuthDiagnostics.java');
+          fs.mkdirSync(pkgDir, { recursive: true });
+          fs.writeFileSync(helperPath, [
+            'package ' + pkg + ';',
+            '',
+            'import android.app.Activity;',
+            'import android.content.Intent;',
+            'import android.net.Uri;',
+            'import android.util.Log;',
+            '',
+            'public final class ApkforgeOAuthDiagnostics {',
+            '    private static final String TAG = "APKForgeOAuth";',
+            '',
+            '    public static void logActivity(String stage, Activity activity, Intent intent) {',
+            '        try {',
+            '            Log.i(TAG, stage + " taskId=" + activity.getTaskId() + " finishing=" + activity.isFinishing() + " changingConfig=" + activity.isChangingConfigurations() + " intent=" + sanitize(intent));',
+            '        } catch (Throwable t) {',
+            '            Log.e(TAG, "diagnostic logger failed at " + stage, t);',
+            '        }',
+            '    }',
+            '',
+            '    private static String sanitize(Intent intent) {',
+            '        if (intent == null) return "none";',
+            '        Uri data = intent.getData();',
+            '        if (data == null) return "action=" + intent.getAction() + " data=none";',
+            '        StringBuilder keys = new StringBuilder();',
+            '        try {',
+            '            for (String name : data.getQueryParameterNames()) {',
+            '                String lower = name.toLowerCase();',
+            '                if (lower.contains("token") || lower.contains("secret") || lower.contains("password") || lower.contains("refresh") || lower.contains("access")) continue;',
+            '                if (keys.length() > 0) keys.append(",");',
+            '                keys.append(name);',
+            '            }',
+            '        } catch (Throwable ignored) {}',
+            '        return "action=" + intent.getAction() + " scheme=" + data.getScheme() + " host=" + data.getHost() + " path=" + data.getPath() + " queryKeys=" + keys;',
+            '    }',
+            '}',
+            ''
+          ].join('\\n'));
+          function insertBeforeLastBrace(source, block) {
+            const idx = source.lastIndexOf('}');
+            if (idx < 0) throw new Error('MainActivity.java is malformed; missing class closing brace.');
+            return source.slice(0, idx) + block + '\\n' + source.slice(idx);
+          }
+          function injectIntoMethod(source, regex, line) {
+            const match = regex.exec(source);
+            if (!match) return null;
+            const open = source.indexOf('{', match.index);
+            if (open < 0) return source;
+            if (source.slice(open, open + 240).includes(line)) return source;
+            return source.slice(0, open + 1) + '\\n        ' + line + source.slice(open + 1);
+          }
+          const needsBundle = /void\\s+onCreate\\s*\\(/.test(main) && !/import\\s+android\\.os\\.Bundle;/.test(main);
+          const needsIntent = /void\\s+onNewIntent\\s*\\(/.test(main) && !/import\\s+android\\.content\\.Intent;/.test(main);
+          if (needsBundle || needsIntent) {
+            main = main.replace(/(package\\s+[^;]+;\\s*)/, '$1\\n' + (needsIntent ? 'import android.content.Intent;\\n' : '') + (needsBundle ? 'import android.os.Bundle;\\n' : ''));
+          }
+          if (/ApkforgeOAuthDiagnostics/.test(main)) {
+            log('[oauth-diagnostics] MainActivity lifecycle diagnostics already present');
+          } else {
+            let patched = injectIntoMethod(main, /(?:public|protected)\\s+void\\s+onCreate\\s*\\([^)]*\\)/, 'ApkforgeOAuthDiagnostics.logActivity("onCreate", this, getIntent());');
+            if (patched) main = patched;
+            else main = insertBeforeLastBrace(main, '\\n    @Override\\n    protected void onCreate(android.os.Bundle savedInstanceState) {\\n        super.onCreate(savedInstanceState);\\n        ApkforgeOAuthDiagnostics.logActivity("onCreate", this, getIntent());\\n    }\\n');
+            patched = injectIntoMethod(main, /(?:public|protected)\\s+void\\s+onNewIntent\\s*\\([^)]*\\)/, 'ApkforgeOAuthDiagnostics.logActivity("onNewIntent", this, intent);');
+            if (patched) main = patched;
+            else main = insertBeforeLastBrace(main, '\\n    @Override\\n    public void onNewIntent(android.content.Intent intent) {\\n        super.onNewIntent(intent);\\n        setIntent(intent);\\n        ApkforgeOAuthDiagnostics.logActivity("onNewIntent", this, intent);\\n    }\\n');
+            patched = injectIntoMethod(main, /(?:public|protected)\\s+void\\s+onResume\\s*\\([^)]*\\)/, 'ApkforgeOAuthDiagnostics.logActivity("onResume", this, getIntent());');
+            if (patched) main = patched;
+            else main = insertBeforeLastBrace(main, '\\n    @Override\\n    public void onResume() {\\n        super.onResume();\\n        ApkforgeOAuthDiagnostics.logActivity("onResume", this, getIntent());\\n    }\\n');
+            patched = injectIntoMethod(main, /(?:public|protected)\\s+void\\s+onDestroy\\s*\\([^)]*\\)/, 'ApkforgeOAuthDiagnostics.logActivity("onDestroy", this, getIntent());');
+            if (patched) main = patched;
+            else main = insertBeforeLastBrace(main, '\\n    @Override\\n    public void onDestroy() {\\n        ApkforgeOAuthDiagnostics.logActivity("onDestroy", this, getIntent());\\n        super.onDestroy();\\n    }\\n');
+            fs.writeFileSync(mainPath, main);
+            log('[oauth-diagnostics] Injected Android lifecycle diagnostics into ' + mainPath);
+          }
+          log('[oauth-diagnostics] Created sanitized logcat helper at ' + helperPath);
+          NODEEOF
+          node /tmp/apkforge-mainactivity-diagnostics.cjs
+
+      - name: Decode keystore
+        run: |
+          set -e
+          mkdir -p project/android/app
+          echo "\${{ secrets.APKFORGE_KEYSTORE_B64 }}" | base64 -d > project/android/app/release.keystore
+      - name: Validate Android signing
+        env:
+          KEYSTORE_PASSWORD: \${{ secrets.APKFORGE_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: \${{ secrets.APKFORGE_KEY_PASSWORD }}
+          CONFIGURED_ALIAS: \${{ secrets.APKFORGE_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          KS="project/android/app/release.keystore"
+          REPORT_S="project/android-signing-diagnostics.txt"
+          : > "$REPORT_S"
+
+          log() { echo "$1" | tee -a "$REPORT_S"; }
+          fail() { log "SIGNING_VALIDATION_FAILED: $1"; echo "::error::$1"; exit 1; }
+
+          log "========== APKForge signing diagnostics =========="
+          log "Keystore path: $KS"
+          if [ ! -f "$KS" ]; then
+            fail "Missing keystore file after decode. Re-upload the Android keystore in Settings."
+          fi
+          if [ ! -s "$KS" ]; then
+            fail "Decoded keystore is empty. Re-upload a valid .jks or .keystore file."
+          fi
+          log "Keystore exists: yes"
+          log "Keystore size: $(wc -c < "$KS") bytes"
+
+          if [ -z "\${KEYSTORE_PASSWORD:-}" ]; then
+            fail "Missing keystore password. Update the keystore in Settings."
+          fi
+          if [ -z "\${KEY_PASSWORD:-}" ]; then
+            fail "Missing key password. Update the keystore in Settings."
+          fi
+
+          LIST_OUT="$(mktemp)"
+          if ! keytool -list -v -keystore "$KS" -storepass "$KEYSTORE_PASSWORD" > "$LIST_OUT" 2>&1; then
+            if grep -Eiq "password was incorrect|keystore password was incorrect|tampered with|integrity check failed" "$LIST_OUT"; then
+              fail "Invalid keystore password. The saved store password does not open this keystore."
+            fi
+            if grep -Eiq "Invalid keystore format|Unrecognized keystore format|toDerInputStream rejects tag|not a keystore" "$LIST_OUT"; then
+              fail "Corrupted or unsupported keystore file. Upload a valid JKS or PKCS12 keystore."
+            fi
+            fail "Unable to read keystore: $(tail -n 5 "$LIST_OUT" | tr '\\n' ' ' | sed 's/::/:/g')"
+          fi
+          log "Keystore password: valid"
+
+          ALIASES="$(grep -E '^Alias name:' "$LIST_OUT" | sed 's/^Alias name: //' | sed '/^$/d')"
+          ALIAS_COUNT="$(printf '%s\\n' "$ALIASES" | sed '/^$/d' | wc -l | tr -d ' ')"
+          if [ "$ALIAS_COUNT" = "0" ]; then
+            fail "No signing aliases found in the keystore. Upload a keystore containing a private key entry."
+          fi
+          log "Aliases found ($ALIAS_COUNT):"
+          printf '%s\\n' "$ALIASES" | sed 's/^/- /' | tee -a "$REPORT_S"
+
+          FINAL_ALIAS="\${CONFIGURED_ALIAS:-}"
+          if [ -n "$FINAL_ALIAS" ] && printf '%s\\n' "$ALIASES" | grep -Fx -- "$FINAL_ALIAS" >/dev/null; then
+            log "Configured alias: found"
+          elif [ "$ALIAS_COUNT" = "1" ]; then
+            FINAL_ALIAS="$(printf '%s\\n' "$ALIASES" | head -n 1)"
+            log "Configured alias was missing or blank; auto-selected only alias: $FINAL_ALIAS"
+          else
+            AVAILABLE_ALIASES="$(printf '%s\\n' "$ALIASES" | paste -sd ', ' -)"
+            log "Configured alias: missing"
+            fail "Configured key alias does not exist in the keystore. Available aliases: $AVAILABLE_ALIASES. Update the keystore alias in Settings."
+          fi
+
+          KEY_OUT="$(mktemp)"
+          if ! keytool -certreq -keystore "$KS" -storepass "$KEYSTORE_PASSWORD" -alias "$FINAL_ALIAS" -keypass "$KEY_PASSWORD" -file /tmp/apkforge-signing-validation.csr > "$KEY_OUT" 2>&1; then
+            if grep -Eiq "Cannot recover key|password was incorrect|Given final block not properly padded|pad block corrupted" "$KEY_OUT"; then
+              fail "Invalid key password for alias '$FINAL_ALIAS'. Update the key password in Settings."
+            fi
+            if grep -Eiq "Alias <.*> does not exist|does not exist" "$KEY_OUT"; then
+              fail "Alias '$FINAL_ALIAS' does not exist in the keystore."
+            fi
+            fail "Unable to validate key password for alias '$FINAL_ALIAS': $(tail -n 5 "$KEY_OUT" | tr '\\n' ' ' | sed 's/::/:/g')"
+          fi
+          log "Key password: valid"
+          log "Final signing alias: $FINAL_ALIAS"
+
+          # Record the release certificate's SHA-256 fingerprint so the final
+          # APK can be checked against it after Gradle — a signature that
+          # verifies but comes from the wrong certificate (e.g. Gradle
+          # silently falling back to debug signing) must still fail the build.
+          ALIAS_OUT="$(mktemp)"
+          keytool -list -v -keystore "$KS" -storepass "$KEYSTORE_PASSWORD" -alias "$FINAL_ALIAS" > "$ALIAS_OUT" 2>&1 || true
+          CERT_SHA256="$(grep -A1 -i 'SHA256:' "$ALIAS_OUT" | grep -Eo '([0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}' | tr -d ':' | tr 'A-F' 'a-f' | head -n 1)"
+          if [ -z "$CERT_SHA256" ]; then
+            fail "Could not extract the SHA-256 certificate fingerprint for alias '$FINAL_ALIAS' from the keystore. Cannot verify the final APK is signed with the expected certificate."
+          fi
+          log "Certificate SHA-256: $CERT_SHA256"
+          echo "APKFORGE_EXPECTED_CERT_SHA256=$CERT_SHA256" >> "$GITHUB_ENV"
+
+          log "SIGNING_VALIDATION_PASSED"
+          log "========== APKForge signing diagnostics complete =========="
+          echo "APKFORGE_VALIDATED_KEY_ALIAS=$FINAL_ALIAS" >> "$GITHUB_ENV"
+
+      - name: Configure explicit Gradle release signing
+        working-directory: project/android
+        run: |
+          set -e
+          REPORT_S="../android-signing-diagnostics.txt"
+          log() { echo "$1" | tee -a "$REPORT_S"; }
+          fail() { log "SIGNING_CONFIG_FAILED: $1"; echo "::error::$1"; exit 1; }
+
+          # -Pandroid.injected.signing.* alone is not a reliable signing
+          # mechanism for a plain "./gradlew assembleRelease" invocation —
+          # those properties are consumed by Android Studio's own "Generate
+          # Signed Bundle/APK" flow, not guaranteed to attach to a normal
+          # command-line release build. Relying on it alone is the actual
+          # root cause of intermittent unsigned/unreliable release APKs.
+          # Patch an explicit signingConfigs block into the app module's
+          # build file instead — reading secret values from environment
+          # variables at Gradle-evaluation time, never writing them to disk.
+          GRADLE_FILE=""
+          GRADLE_KIND=""
+          if [ -f app/build.gradle.kts ]; then
+            GRADLE_FILE="app/build.gradle.kts"; GRADLE_KIND="kts"
+          elif [ -f app/build.gradle ]; then
+            GRADLE_FILE="app/build.gradle"; GRADLE_KIND="groovy"
+          else
+            fail "Neither app/build.gradle nor app/build.gradle.kts exists — cannot configure release signing."
+          fi
+          log "[signing-config] Patching $GRADLE_FILE ($GRADLE_KIND)"
+          cp "$GRADLE_FILE" "$GRADLE_FILE.apkforge.bak"
+          export GRADLE_FILE GRADLE_KIND
+
+          node <<'NODEEOF'
+          const fs = require('fs');
+          const kind = process.env.GRADLE_KIND;
+          const file = process.env.GRADLE_FILE;
+          let src = fs.readFileSync(file, 'utf8');
+
+          const alreadyPatched = src.includes('APKFORGE_MANAGED_SIGNING_CONFIG');
+
+          if (kind === 'groovy') {
+            const signingBlock = [
+              '',
+              '    signingConfigs {',
+              '        release {',
+              '            // APKFORGE_MANAGED_SIGNING_CONFIG -- generated at build time, values',
+              '            // come from environment variables, never written to disk as literals.',
+              '            storeFile file(System.getenv("APKFORGE_KS_FILE"))',
+              '            storePassword System.getenv("APKFORGE_KS_PASSWORD")',
+              '            keyAlias System.getenv("APKFORGE_KEY_ALIAS")',
+              '            keyPassword System.getenv("APKFORGE_KEY_PASSWORD")',
+              '        }',
+              '    }',
+              '',
+            ].join('\n');
+            if (!alreadyPatched) {
+              const androidBlockMatch = src.match(/android\s*\{/);
+              if (!androidBlockMatch) throw new Error('Could not find an android {} block in ' + file);
+              const insertAt = androidBlockMatch.index + androidBlockMatch[0].length;
+              src = src.slice(0, insertAt) + signingBlock + src.slice(insertAt);
+            }
+
+            if (/buildTypes\s*\{[\s\S]*?release\s*\{[\s\S]*?signingConfig\s+signingConfigs\.release/.test(src)) {
+              // already wired
+            } else {
+              const buildTypesMatch = src.match(/buildTypes\s*\{/);
+              if (!buildTypesMatch) throw new Error('Could not find a buildTypes {} block in ' + file);
+              const buildTypesStart = buildTypesMatch.index + buildTypesMatch[0].length;
+              // Search for the release block ONLY from here on — searching the
+              // whole file would match the signingConfigs.release block just
+              // inserted above instead of buildTypes.release.
+              const afterBuildTypes = src.slice(buildTypesStart);
+              const releaseMatch = afterBuildTypes.match(/release\s*\{/);
+              if (!releaseMatch) throw new Error('Could not find a release {} build type block inside buildTypes {} in ' + file);
+              const releaseInsertAt = buildTypesStart + releaseMatch.index + releaseMatch[0].length;
+              src = src.slice(0, releaseInsertAt) + '\n            signingConfig signingConfigs.release' + src.slice(releaseInsertAt);
+            }
+          } else {
+            const signingBlock = [
+              '',
+              '    signingConfigs {',
+              '        create("release") {',
+              '            // APKFORGE_MANAGED_SIGNING_CONFIG -- generated at build time, values',
+              '            // come from environment variables, never written to disk as literals.',
+              '            storeFile = file(System.getenv("APKFORGE_KS_FILE")!!)',
+              '            storePassword = System.getenv("APKFORGE_KS_PASSWORD")',
+              '            keyAlias = System.getenv("APKFORGE_KEY_ALIAS")',
+              '            keyPassword = System.getenv("APKFORGE_KEY_PASSWORD")',
+              '        }',
+              '    }',
+              '',
+            ].join('\n');
+            if (!alreadyPatched) {
+              const androidBlockMatch = src.match(/android\s*\{/);
+              if (!androidBlockMatch) throw new Error('Could not find an android {} block in ' + file);
+              const insertAt = androidBlockMatch.index + androidBlockMatch[0].length;
+              src = src.slice(0, insertAt) + signingBlock + src.slice(insertAt);
+            }
+
+            if (/getByName\("release"\)[\s\S]*?signingConfig\s*=\s*signingConfigs\.getByName\("release"\)/.test(src)) {
+              // already wired
+            } else {
+              const buildTypesMatch = src.match(/buildTypes\s*\{/);
+              if (!buildTypesMatch) throw new Error('Could not find a buildTypes {} block in ' + file);
+              const buildTypesStart = buildTypesMatch.index + buildTypesMatch[0].length;
+              const afterBuildTypes = src.slice(buildTypesStart);
+              // Search only from buildTypes onward, same reasoning as the
+              // Groovy branch — must not match the signingConfigs.create(...)
+              // block just inserted above.
+              let releaseMatch = afterBuildTypes.match(/getByName\("release"\)\s*\{/);
+              let insertText = '\n            signingConfig = signingConfigs.getByName("release")';
+              if (!releaseMatch) releaseMatch = afterBuildTypes.match(/release\s*\{/);
+              if (!releaseMatch) throw new Error('Could not find a release build type block inside buildTypes {} in ' + file);
+              const releaseInsertAt = buildTypesStart + releaseMatch.index + releaseMatch[0].length;
+              src = src.slice(0, releaseInsertAt) + insertText + src.slice(releaseInsertAt);
+            }
+          }
+
+          fs.writeFileSync(file, src);
+          console.log('[signing-config] patched ' + file);
+          NODEEOF
+
+          if ! grep -q "APKFORGE_MANAGED_SIGNING_CONFIG" "$GRADLE_FILE"; then
+            fail "Failed to patch an explicit signingConfigs block into $GRADLE_FILE — release build would be unsigned or fall back to debug signing."
+          fi
+          log "[signing-config] Explicit release signingConfig attached in $GRADLE_FILE"
+          echo "SIGNING_CONFIG_ATTACHED: yes" | tee -a "$REPORT_S"
+
+      - name: Gradle build
+        working-directory: project/android
+        env:
+          GRADLE_OPTS: "-Xmx2g -Dorg.gradle.jvmargs=-Xmx2g"
+          APKFORGE_KS_PASSWORD: \${{ secrets.APKFORGE_KEYSTORE_PASSWORD }}
+          APKFORGE_KEY_PASSWORD: \${{ secrets.APKFORGE_KEY_PASSWORD }}
+        run: |
+          set -e
+          # Gradle wrapper preflight (toolchain verification, part 2) — repair first.
+          if [ ! -f ./gradlew ] || [ ! -f gradle/wrapper/gradle-wrapper.properties ] || [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "REPAIR: Gradle wrapper is incomplete — regenerating the native Android project" | tee -a "$REPORT"
+            cd ..
+            rm -rf android
+            npx cap add android >> "$REPORT" 2>&1 || true
+            npx cap sync android >> "$REPORT" 2>&1 || true
+            cd android
+          fi
+          [ -f ./gradlew ] || { echo "PREBUILD_VALIDATION_FAILED: DEPENDENCY_VALIDATION_FAILED: android/gradlew is missing and could not be regenerated." | tee -a "$REPORT"; exit 1; }
+          [ -f gradle/wrapper/gradle-wrapper.properties ] || { echo "PREBUILD_VALIDATION_FAILED: DEPENDENCY_VALIDATION_FAILED: android/gradle/wrapper/gradle-wrapper.properties is missing, so no Gradle version is declared." | tee -a "$REPORT"; exit 1; }
+          grep -n "distributionUrl" gradle/wrapper/gradle-wrapper.properties | tee -a "$REPORT"
+          chmod +x ./gradlew
+          ./gradlew --version | sed -n '1,8p' | tee -a "$REPORT"
+
+          ./gradlew --no-daemon clean
+          export APKFORGE_KS_FILE="\${{ github.workspace }}/project/android/app/release.keystore"
+          export APKFORGE_KEY_ALIAS="$APKFORGE_VALIDATED_KEY_ALIAS"
+          # The explicit signingConfigs block patched into build.gradle above
+          # reads APKFORGE_KS_FILE / APKFORGE_KS_PASSWORD / APKFORGE_KEY_ALIAS /
+          # APKFORGE_KEY_PASSWORD directly via System.getenv(...) — that is now
+          # the real signing mechanism. The -Pandroid.injected.signing.* flags
+          # are kept as a harmless redundant fallback only; they are not relied
+          # upon.
+          KS_PASS="\${{ secrets.APKFORGE_KEYSTORE_PASSWORD }}"
+          KEY_PASS="\${{ secrets.APKFORGE_KEY_PASSWORD }}"
+          KS_FILE="$APKFORGE_KS_FILE"
+          gradle_release() {
+            ./gradlew --no-daemon "$1" \\
+              -Pandroid.injected.signing.store.file="$KS_FILE" \\
+              -Pandroid.injected.signing.store.password="$KS_PASS" \\
+              -Pandroid.injected.signing.key.alias="$APKFORGE_VALIDATED_KEY_ALIAS" \\
+              -Pandroid.injected.signing.key.password="$KEY_PASS"
+          }
+          gradle_release assembleRelease
+          gradle_release bundleRelease || echo "::warning::AAB (bundleRelease) could not be produced; APK is unaffected."
+
+
+
+
+      - name: Verify release APK
+        working-directory: project
+        run: |
+          set -e
+          VERIFY="android-apk-verification.txt"
+          : > "$VERIFY"
+          log() { echo "$1" | tee -a "$VERIFY"; }
+          fail() { log "APK_VERIFICATION_FAILED: $1"; echo "::error::$1"; exit 1; }
+
+          APK="$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1 || true)"
+          [ -n "$APK" ] || fail "No release APK was produced by Gradle."
+          log "========== APKForge APK verification =========="
+          log "APK: $APK ($(wc -c < "$APK") bytes)"
+
+          BT_DIR="$(ls -d \${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools/* 2>/dev/null | sort -V | tail -n 1 || true)"
+          AAPT2="$BT_DIR/aapt2"; APKSIGNER="$BT_DIR/apksigner"
+
+          if [ -x "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --print-certs "$APK" | tee -a "$VERIFY" || fail "The release APK is not correctly signed."
+            log "Signature: valid"
+
+            # A signature that merely *verifies* is not enough — Gradle must
+            # have signed with the same certificate the preflight step
+            # validated. Without this check, a silent fallback to debug
+            # signing (or the wrong keystore) would still say "signed
+            # correctly" here.
+            if [ -n "\${APKFORGE_EXPECTED_CERT_SHA256:-}" ]; then
+              ACTUAL_SHA256="$("$APKSIGNER" verify --print-certs "$APK" 2>/dev/null | grep -i 'SHA-256 digest' | head -n 1 | sed -E 's/.*: *//' | tr -d ' ' | tr 'A-F' 'a-f')"
+              if [ -z "$ACTUAL_SHA256" ]; then
+                fail "Could not extract the signing certificate's SHA-256 digest from the built APK to verify it against the configured keystore."
+              fi
+              log "Expected certificate SHA-256: \${APKFORGE_EXPECTED_CERT_SHA256}"
+              log "Actual certificate SHA-256:   $ACTUAL_SHA256"
+              if [ "$ACTUAL_SHA256" != "\${APKFORGE_EXPECTED_CERT_SHA256}" ]; then
+                fail "The release APK is signed with a certificate that does not match the configured keystore (expected \${APKFORGE_EXPECTED_CERT_SHA256}, got $ACTUAL_SHA256). This usually means Gradle fell back to debug signing or used a different keystore — the build must not be trusted."
+              fi
+              log "Certificate fingerprint: matches configured keystore"
+            else
+              log "::warning::No expected certificate fingerprint was recorded during signing preflight — skipping certificate-match verification."
+            fi
+          else
+            jarsigner -verify "$APK" | tee -a "$VERIFY" || fail "The release APK is not correctly signed."
+            log "Signature: valid (jarsigner)"
+            log "::warning::apksigner unavailable — falling back to jarsigner, which cannot verify the certificate fingerprint matches the configured keystore."
+          fi
+
+          if [ -x "$AAPT2" ]; then
+            "$AAPT2" dump badging "$APK" > /tmp/badging.txt 2>&1 || fail "Could not read the APK manifest."
+            PKG="$(sed -n "s/^package: name='\\([^']*\\)'.*/\\1/p" /tmp/badging.txt | head -n 1)"
+            log "Package: $PKG (expected $BUNDLE_ID)"
+            [ "$PKG" = "$BUNDLE_ID" ] || fail "APK package '$PKG' does not match the configured bundle id '$BUNDLE_ID'."
+
+            "$AAPT2" dump xmltree --file AndroidManifest.xml "$APK" > /tmp/xmltree.txt 2>&1 || true
+            grep -q "android.intent.action.VIEW" /tmp/xmltree.txt || fail "The APK contains no deep-link intent filter (VIEW action)."
+            grep -q "android.intent.category.BROWSABLE" /tmp/xmltree.txt || fail "The APK deep-link intent filter is not BROWSABLE, so OAuth callbacks cannot return to the app."
+            log "Deep-link intent filters: present"
+
+            if [ -f android-expected-schemes.txt ]; then
+              while read -r s; do
+                [ -n "$s" ] || continue
+                if grep -qi "\\"$s\\"" /tmp/xmltree.txt; then
+                  log "Scheme present: $s://"
+                else
+                  fail "Expected URL scheme '$s://' is missing from the built APK."
+                fi
+              done < android-expected-schemes.txt
+            fi
+
+            grep -Eqi "BridgeActivity|MainActivity" /tmp/xmltree.txt || fail "No Capacitor bridge activity found in the APK manifest."
+            log "Capacitor bridge activity: present"
+          else
+            log "WARNING: aapt2 not available — skipped manifest introspection"
+          fi
+
+          unzip -l "$APK" | grep -q "assets/public/index.html" || fail "Web assets are missing from the APK (assets/public/index.html not found)."
+          log "Web assets: bundled"
+          # Only packages that expose an @CapacitorPlugin class are expected in
+          # capacitor.plugins.json; Gradle-only helper packages are not.
+          if [ -n "\${APKFORGE_RUNTIME_PLUGINS:-}" ]; then
+            unzip -p "$APK" assets/capacitor.plugins.json > /tmp/apk-plugins.json 2>/dev/null || fail "capacitor.plugins.json is missing from the packaged APK — Capacitor plugins were not bundled."
+            cat /tmp/apk-plugins.json | tee -a "$VERIFY"
+            MISSING_IN_APK=""
+            for p in $(echo "$APKFORGE_RUNTIME_PLUGINS" | tr ',' ' '); do
+              grep -q "\\"$p\\"" /tmp/apk-plugins.json || MISSING_IN_APK="$MISSING_IN_APK $p"
+            done
+            [ -z "$MISSING_IN_APK" ] || fail "These Capacitor plugins are registered in the project but missing from the packaged APK's assets/capacitor.plugins.json, so they would fail at runtime with \\"plugin is not implemented on android\\":$MISSING_IN_APK"
+            log "Packaged plugins: verified"
+
+            # capacitor.plugins.json alone is metadata, not proof the native
+            # class survived compilation/minification. For every official
+            # @capacitor/* plugin (whose class naming is predictable —
+            # com.capacitorjs.plugins.<name>.<Name>Plugin) cross-check the
+            # actual classes*.dex of the built APK. Third-party plugins don't
+            # follow a guaranteed naming convention, so they're left to the
+            # capacitor.plugins.json check above rather than guessed at.
+            DEX_LIST="$(unzip -Z1 "$APK" 'classes*.dex' 2>/dev/null)"
+            DEX_STRINGS_FILE="$(mktemp)"
+            for DEX in $DEX_LIST; do
+              unzip -p "$APK" "$DEX" 2>/dev/null | strings >> "$DEX_STRINGS_FILE"
+            done
+            DEX_CLASS_MISSING=""
+            for p in $(echo "$APKFORGE_RUNTIME_PLUGINS" | tr ',' ' '); do
+              case "$p" in
+                @capacitor/*)
+                  PNAME="\${p#@capacitor/}"
+                  # e.g. @capacitor/local-notifications -> localnotifications
+                  PNAME_NORM="$(echo "$PNAME" | tr -d '-')"
+                  if grep -qi "capacitorjs/plugins/$PNAME_NORM/" "$DEX_STRINGS_FILE" 2>/dev/null || grep -qi "capacitorjs/plugins/$PNAME/" "$DEX_STRINGS_FILE" 2>/dev/null; then
+                    log "DEX class present: $p"
+                  else
+                    log "DEX class NOT FOUND: $p (checked classes*.dex for com.capacitorjs.plugins.$PNAME_NORM.*)"
+                    DEX_CLASS_MISSING="$DEX_CLASS_MISSING $p"
+                  fi
+                  ;;
+                *)
+                  log "DEX check skipped for third-party plugin (no guaranteed class naming): $p"
+                  ;;
+              esac
+            done
+            rm -f "$DEX_STRINGS_FILE"
+            [ -z "$DEX_CLASS_MISSING" ] || fail "These official Capacitor plugins are registered in capacitor.plugins.json but their compiled native class was not found in the APK's classes*.dex — they would fail at runtime with \\"plugin is not implemented on android\\" even though the registration looked correct:$DEX_CLASS_MISSING"
+            log "DEX-level plugin verification: passed"
+          else
+            log "No Capacitor plugins declared — skipping packaged plugin check"
+          fi
+          log "APK_VERIFICATION_PASSED"
+
+      - name: Browser plugin forensic trace (post-APK)
+        if: success() || failure()
+        working-directory: project
+        run: |
+          set +e
+          if [ -f /tmp/apkforge-browser-trace.sh ]; then
+            bash /tmp/apkforge-browser-trace.sh post-apk
+          else
+            echo "Browser plugin trace script unavailable (pipeline failed before sync)."
+          fi
+          exit 0
+
+      - name: Preferences plugin forensic trace (post-APK)
+        if: success() || failure()
+        working-directory: project
+        run: |
+          set +e
+          if [ -f /tmp/apkforge-preferences-trace.sh ]; then
+            bash /tmp/apkforge-preferences-trace.sh post-apk
+          else
+            echo "Preferences plugin trace script unavailable (pipeline failed before sync)."
+          fi
+          exit 0
+
+      - name: App plugin forensic trace (post-APK)
+        if: success() || failure()
+        working-directory: project
+        run: |
+          set +e
+          if [ -f /tmp/apkforge-app-trace.sh ]; then
+            bash /tmp/apkforge-app-trace.sh post-apk
+          else
+            echo "App plugin trace script unavailable (pipeline failed before sync)."
+          fi
+          exit 0
+
+
+
+
+      - name: Final diagnostics report
+        if: success() || failure()
+        working-directory: project
+        run: |
+          set +e
+          FINAL="android-build-report.txt"
+          {
+            echo "========== APKForge final build report =========="
+            echo "Build id:            \${BUILD_ID}"
+            echo "App name:            \${APP_NAME}"
+            echo "Bundle id:           \${BUNDLE_ID}"
+            echo "Framework:           \${DETECTED_FRAMEWORK:-unknown}"
+            echo "Package manager:     \${PM:-npm}"
+            echo "Build command:       \${RUN_CMD:-npm run} build"
+            echo "Declared webDir:     \${DECLARED_WEB_DIR:-\${WEB_DIR}}"
+            echo "Resolved webDir:     \${RESOLVED_WEB_DIR:-unresolved}"
+            echo "index.html:          \${RESOLVED_WEB_DIR:-?}/index.html"
+            echo "Capacitor config:    \${CAP_CONFIG_PATH:-none}"
+            echo "Capacitor version:   $(npx cap --version 2>/dev/null || echo unknown)"
+            echo "Java version:        $(java -version 2>&1 | head -n 1)"
+            echo "Gradle version:      $( [ -f android/gradle/wrapper/gradle-wrapper.properties ] && sed -n 's/.*gradle-\\([0-9.]*\\)-.*/\\1/p' android/gradle/wrapper/gradle-wrapper.properties | head -n 1 || echo unknown )"
+            echo "Android SDK:         \${ANDROID_HOME:-not set}"
+            echo "Signing alias:       \${APKFORGE_VALIDATED_KEY_ALIAS:-unresolved}"
+            echo "Installed plugins:   \${APKFORGE_PLUGINS:-none}"
+            echo "Auto-installed:      \${APKFORGE_AUTO_PLUGINS:-none}"
+            echo "Repaired files:      \${APKFORGE_REPAIRS:-none}"
+            echo "APK:                 $(find android/app/build/outputs/apk/release -name '*.apk' 2>/dev/null | head -n 1 || echo none)"
+            echo "AAB:                 $(find android/app/build/outputs/bundle/release -name '*.aab' 2>/dev/null | head -n 1 || echo none)"
+            echo "Runtime OAuth:       NOT tested in CI — manual device testing required."
+            echo "================================================="
+            echo
+            [ -f android-prebuild-report.txt ] && cat android-prebuild-report.txt
+            echo
+            [ -f android-signing-diagnostics.txt ] && cat android-signing-diagnostics.txt
+            echo
+            [ -f android-apk-verification.txt ] && cat android-apk-verification.txt
+            echo
+            [ -f browser-plugin-trace.txt ] && cat browser-plugin-trace.txt
+            echo
+            [ -f preferences-plugin-trace.txt ] && cat preferences-plugin-trace.txt
+            echo
+            [ -f app-plugin-trace.txt ] && cat app-plugin-trace.txt
+
+          } > "$FINAL" 2>&1
+          cat "$FINAL"
+
+      - name: Upload APK
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-\${{ github.event.inputs.build_id }}
+          path: |
+            project/android/app/build/outputs/apk/release/*.apk
+            project/android-build-report.txt
+            project/android-prebuild-report.txt
+            project/android-signing-diagnostics.txt
+            project/android-apk-verification.txt
+            project/browser-plugin-trace.txt
+            project/preferences-plugin-trace.txt
+            project/app-plugin-trace.txt
+          if-no-files-found: error
+      - name: Upload AAB
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aab-\${{ github.event.inputs.build_id }}
+          path: project/android/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: ignore
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-\${{ github.event.inputs.build_id }}
+          path: |
+            project/android-build-report.txt
+            project/android-prebuild-report.txt
+            project/android-signing-diagnostics.txt
+            project/android-apk-verification.txt
+            project/browser-plugin-trace.txt
+            project/preferences-plugin-trace.txt
+            project/app-plugin-trace.txt
+          if-no-files-found: ignore
+
+      - name: Finalize APKForge build
+        if: always()
+        run: |
+          set +e
+          if [ -z "\${FINALIZE_ENDPOINT:-}" ] || [ -z "\${DIAGNOSTIC_TOKEN:-}" ]; then
+            echo "APKForge finalize skipped: no endpoint/token"
+            exit 0
+          fi
+          python3 - <<'PYEOF' > /tmp/apkforge-finalize.json
+          import json, os
+          print(json.dumps({
+            "buildId": os.environ.get("BUILD_ID", ""),
+            "token": os.environ.get("DIAGNOSTIC_TOKEN", ""),
+            "runId": os.environ.get("GITHUB_RUN_ID", ""),
+            "jobStatus": "\${{ job.status }}",
+          }))
+          PYEOF
+          curl -fsS -X POST "$FINALIZE_ENDPOINT" -H 'content-type: application/json' --data-binary @/tmp/apkforge-finalize.json || true
+`;
